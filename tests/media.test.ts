@@ -193,6 +193,14 @@ describe('encode size negotiation', () => {
     assert.equal(scaleBitrate(6_000, host, { width: 640, height: 360 }), 2_500);
   });
 
+  test('does not bake the host cursor into the video', () => {
+    // The controller renders its own local cursor; a baked-in one lags
+    // behind the real pointer and makes clicks feel mis-aimed.
+    const base = { source: { kind: 'screen' as const, mode: 'gdi' as const }, encoder: 'libx264' as const, onAccessUnit: () => {} };
+    const args = buildEncoderArgs(base);
+    assert.equal(args[args.indexOf('-draw_mouse') + 1], '0');
+  });
+
   test('only adds a scale stage when the frame is actually resized', () => {
     const base = { source: { kind: 'screen' as const, mode: 'gdi' as const }, encoder: 'libx264' as const, onAccessUnit: () => {} };
     assert.equal(buildEncoderArgs(base).includes('-vf'), false);

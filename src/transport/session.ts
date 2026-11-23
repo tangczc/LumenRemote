@@ -336,7 +336,11 @@ export class Session {
 
     if (this.fecEnabled && fragments.length > 2) {
       const data = fragments.map((f) => f.data);
-      const r = parityCountFor(fragments.length, this.cc.lossRate);
+      // On a clean link the 12.5% minimum parity tax buys almost nothing —
+      // NACK retransmission covers the rare loss — and the extra bytes feed
+      // the very congestion that causes loss. Halve the floor until loss
+      // actually shows up.
+      const r = parityCountFor(fragments.length, this.cc.lossRate, this.cc.lossRate < 0.01 ? 0.06 : 0.125);
       const parities = buildParity(data, r);
       for (const p of parities) {
         this.sendPacket(
@@ -357,14 +361,19 @@ export class Session {
   sendInput(event: InputEvent): void {
     const seq = this.txInputSeq = (this.txInputSeq + 1) & 0xffff;
     const json = Buffer.from(JSON.stringify(event), 'utf8');
-    // 2-byte sequence prefix: the three redundant copies are deduplicated by
-    // the receiver so a lost copy never double-applies a click or keystroke.
+    // 2-byte sequence prefix: redundant copies are deduplicated by the
+    // receiver so a lost copy never double-applies a click or keystroke.
     const payload = Buffer.allocUnsafe(2 + json.length);
     payload.writeUInt16BE(seq, 0);
     json.copy(payload, 2);
-    for (let i = 0; i < 3; i++) {
+    // Pointer moves are self-correcting — the next position supersedes a lost
+    // one within a frame — so triplicating them only triples the packet rate
+    // of a 60-125 Hz mouse for no benefit. Discrete events (clicks, keys,
+    // wheel) keep the full redundancy because losing one loses the action.
+    const copies = event.k === 'ma' || event.k === 'mm' ? 1 : 3;
+    for (let i = 0; i < copies; i++) {
       if (this.closed) return;
-      this.sendPacket(Channel.Input, 0, 0, i, 3, 0, payload, 0);
+      this.sendPacket(Channel.Input, 0, 0, i, copies, 0, payload, 0);
     }
   }
 

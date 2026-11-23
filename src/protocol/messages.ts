@@ -46,6 +46,8 @@ export type ControlMessage =
   | { t: 'nack'; entries: NackEntry[] }
   | { t: 'idr' }
   | { t: 'bitrate'; bps: number }
+  /** Controller viewport changed mid-session (resize / fullscreen): re-encode at a size that fits it. */
+  | { t: 'resize'; width: number; height: number; fps?: number }
   | { t: 'ping'; n: number; t1: number }
   | { t: 'pong'; n: number; t1: number; t2: number; t3: number }
   | { t: 'clipboard'; format: 'text' | 'html'; data: string }

@@ -190,11 +190,16 @@ function reportClientDisplay() {
   if (!stage) return;
   const rect = stage.getBoundingClientRect();
   if (rect.width < 160 || rect.height < 120) return; // not laid out yet
-  const dpr = window.devicePixelRatio || 1;
+  // Report CSS pixels, not device pixels. Multiplying by devicePixelRatio made
+  // a 1920-wide window on a 200%-scaled display ask the host to encode 3840
+  // wide: double the pixels for a picture the browser then scales back down,
+  // which saturated software encoders and made every session feel laggy.
+  // The browser upscales the decoded frame to the display anyway, so CSS
+  // pixels are the honest budget.
   // Round to even numbers: the encoder likes chroma-aligned sizes and this also
   // keeps a one-pixel wobble from re-negotiating the stream.
-  const width = Math.round((rect.width * dpr) / 2) * 2;
-  const height = Math.round((rect.height * dpr) / 2) * 2;
+  const width = Math.round(rect.width / 2) * 2;
+  const height = Math.round(rect.height / 2) * 2;
   const key = `${width}x${height}`;
   if (key === lastClientDisplay) return;
   lastClientDisplay = key;
@@ -211,6 +216,7 @@ function scheduleClientDisplay() {
 
 window.addEventListener('resize', scheduleClientDisplay);
 window.addEventListener('orientationchange', scheduleClientDisplay);
+document.addEventListener('fullscreenchange', scheduleClientDisplay);
 if (typeof ResizeObserver !== 'undefined') {
   const stage = $('#stage');
   if (stage) new ResizeObserver(scheduleClientDisplay).observe(stage);
@@ -568,6 +574,11 @@ let pendingFrame = null;
 let renderQueued = false;
 
 function onDecodedFrame(frame) {
+  // Only the newest decoded frame matters: holding older ones just adds a
+  // frame of latency and leaks VideoFrames that were never closed.
+  if (pendingFrame) {
+    try { pendingFrame.close(); } catch { /* ignore */ }
+  }
   pendingFrame = frame;
   if (renderQueued) return;
   renderQueued = true;
@@ -605,6 +616,21 @@ function handleVideo(buf) {
     if (el) el.textContent = fmtMs(state.lastOneWayMs);
   }
   if (!state.decoder || state.decoder.state !== 'configured') return;
+  // Drop instead of queueing when the decoder is already behind: decoding
+  // every frame while the queue grows turns a brief network hiccup into
+  // seconds of stale video. Interactive remote desktop prefers the newest
+  // frame over a complete but late one. Dropping a delta frame invalidates
+  // every frame that references it, though, so once we drop we must stay
+  // dropped until the next keyframe (and ask for one) rather than feeding
+  // the decoder references it no longer has.
+  const isKey = (flags & 1) !== 0;
+  if (isKey) state.waitingForKey = false;
+  else if (state.waitingForKey) return;
+  else if (state.decoder.decodeQueueSize > 4) {
+    state.waitingForKey = true;
+    send({ type: 'keyframe' });
+    return;
+  }
   try {
     state.decoder.decode(
       new EncodedVideoChunk({
@@ -704,29 +730,82 @@ function setupStageInput() {
   const stage = $('#stage');
   const canvas = $('#screen');
 
+  /**
+   * The canvas element fills the stage but the picture inside it is
+   * letterboxed by `object-fit: contain`, so the element's box is NOT the
+   * picture's box whenever the aspects differ (always, in fullscreen on a
+   * monitor with a different shape than the host's). Mapping against the
+   * element box would shift every click by the black-bar size — clicks
+   * landing beside the target is exactly that bug.
+   */
+  function displayedVideoRect() {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height || !canvas.width || !canvas.height) return null;
+    const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+    const w = canvas.width * scale;
+    const h = canvas.height * scale;
+    return { left: rect.left + (rect.width - w) / 2, top: rect.top + (rect.height - h) / 2, width: w, height: h };
+  }
+
+  function absoluteFromEvent(ev) {
+    const rect = displayedVideoRect();
+    if (!rect) return null;
+    const nx = Math.max(0, Math.min(65535, Math.round(((ev.clientX - rect.left) / rect.width) * 65535)));
+    const ny = Math.max(0, Math.min(65535, Math.round(((ev.clientY - rect.top) / rect.height) * 65535)));
+    return { nx, ny };
+  }
+
   canvas.addEventListener('mousemove', (ev) => {
     if (document.pointerLockElement === stage) {
       queueMove(ev.movementX || 0, ev.movementY || 0);
       return;
     }
-    const rect = canvas.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const nx = Math.max(0, Math.min(65535, Math.round(((ev.clientX - rect.left) / rect.width) * 65535)));
-    const ny = Math.max(0, Math.min(65535, Math.round(((ev.clientY - rect.top) / rect.height) * 65535)));
-    queueAbsolute(nx, ny);
+    const pos = absoluteFromEvent(ev);
+    if (!pos) return;
+    queueAbsolute(pos.nx, pos.ny);
   });
 
+  // DOM MouseEvent.button is 0=left, 1=middle, 2=right, but the wire format
+  // (and the host injector, and Android) use 0=left, 1=right, 2=middle.
+  // Sending ev.button verbatim swapped right- and middle-click.
+  const WIRE_BUTTON = [0, 2, 1, 3, 4];
+  const wireButton = (b) => WIRE_BUTTON[b] ?? 0;
+
   canvas.addEventListener('mousedown', (ev) => {
+    stage.focus();
+    // Position first, then the button. The button used to be sent immediately
+    // while the absolute move waited for the next animation frame, so the
+    // host clicked wherever its cursor already was instead of where the user
+    // pointed. Sending the position synchronously here keeps the two in
+    // order. Pointer lock is deliberately not requested on click: switching
+    // to relative motion mid-session makes every subsequent click land at an
+    // offset the user cannot see. Double-click toggles it for gaming.
     if (document.pointerLockElement !== stage) {
+      const pos = absoluteFromEvent(ev);
+      if (pos) send({ type: 'input', event: { k: 'ma', nx: pos.nx, ny: pos.ny } });
+    }
+    send({ type: 'input', event: { k: 'mb', b: wireButton(ev.button), down: true } });
+    ev.preventDefault();
+  });
+
+  canvas.addEventListener('dblclick', (ev) => {
+    ev.preventDefault();
+    if (document.pointerLockElement === stage) {
+      document.exitPointerLock();
+    } else {
       // Chrome returns a promise here and rejects when the gesture is not trusted,
       // which would otherwise surface as an unhandled rejection.
       Promise.resolve(stage.requestPointerLock?.()).catch(() => undefined);
     }
-    send({ type: 'input', event: { k: 'mb', b: ev.button, down: true } });
-    ev.preventDefault();
   });
 
-  canvas.addEventListener('mouseup', (ev) => send({ type: 'input', event: { k: 'mb', b: ev.button, down: false } }));
+  // Mouseup must be heard even when the pointer left the canvas mid-drag,
+  // otherwise the host button stays pressed.
+  window.addEventListener('mouseup', (ev) => {
+    if (ev.target === canvas || document.pointerLockElement === stage) {
+      send({ type: 'input', event: { k: 'mb', b: wireButton(ev.button), down: false } });
+    }
+  });
   canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
   canvas.addEventListener(
     'wheel',
@@ -767,7 +846,7 @@ function setupStageInput() {
 
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === stage;
-    $('#captureHint').textContent = locked ? '已捕获键鼠 · 按 Esc 释放' : '点击画面以捕获键鼠';
+    $('#captureHint').textContent = locked ? '已捕获键鼠 · 按 Esc 释放' : '双击画面捕获键鼠（游戏用）';
   });
 }
 

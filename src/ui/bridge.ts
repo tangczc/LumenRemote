@@ -25,7 +25,7 @@ export const QUALITY_PRESETS: Record<
   { label: string; fps: number; bitrateKbps: number; netKbps: number; note: string }
 > = {
   office: { label: '办公', fps: 30, bitrateKbps: 6_000, netKbps: 7_600, note: '文字优先 · 低带宽' },
-  balanced: { label: '平衡', fps: 60, bitrateKbps: 12_000, netKbps: 15_000, note: '清晰与流畅兼顾' },
+  balanced: { label: '平衡', fps: 30, bitrateKbps: 8_000, netKbps: 10_000, note: '清晰与流畅兼顾 · 低延迟' },
   game: { label: '游戏', fps: 60, bitrateKbps: 25_000, netKbps: 31_000, note: '高帧率 · 低延迟' },
   uhd: { label: '4K', fps: 60, bitrateKbps: 45_000, netKbps: 56_000, note: '4K60 · 最高画质' },
 };
