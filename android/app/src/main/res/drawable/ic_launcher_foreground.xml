@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Monitor outline with a signal arc, matching the desktop mark. -->
+    <path
+        android:fillColor="#5b8cff"
+        android:pathData="M34,32h40a8,8 0,0 1,8 8v24a8,8 0,0 1,-8 8h-16v6h8a3,3 0,0 1,0 6h-24a3,3 0,0 1,0 -6h8v-6h-16a8,8 0,0 1,-8 -8v-24a8,8 0,0 1,8 -8z" />
+    <path
+        android:fillColor="#0b0d13"
+        android:pathData="M38,40h32a4,4 0,0 1,4 4v20a4,4 0,0 1,-4 4h-32a4,4 0,0 1,-4 -4v-20a4,4 0,0 1,4 -4z" />
+    <path
+        android:strokeColor="#7ea6ff"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M44,58l6,-8 5,5 7,-9 5,6" />
+</vector>

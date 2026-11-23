@@ -1,0 +1,350 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b0d13" />
+    <meta name="lumen-ui-token" content="__LUMEN_UI_TOKEN__" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Lumen" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <title>Lumen Remote</title>
+    <link rel="stylesheet" href="/app.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M16 7l2.4 6.6L25 16l-6.6 2.4L16 25l-2.4-6.6L7 16l6.6-2.4z' fill='%2307080d'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div class="shell">
+      <!-- ------------------------------------------------------- sidebar -->
+      <aside class="sidebar">
+        <div class="brand-row">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="brand">Lumen<em>Remote</em></span>
+        </div>
+
+        <nav class="nav" aria-label="主导航">
+          <div class="nav-group">
+            <button class="nav-group-head" type="button" aria-expanded="true">
+              <svg class="nav-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 20h8M12 16v4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+              <span>我的设备</span>
+              <span class="chev" aria-hidden="true">⌃</span>
+            </button>
+            <button class="nav-item" data-page="devices" type="button">
+              <span class="dot" aria-hidden="true"></span>
+              <span>全部设备</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <button class="nav-group-head" type="button" aria-expanded="true">
+              <svg class="nav-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 8h13a3 3 0 013 3v6a2 2 0 01-2 2H6a2 2 0 01-2-2V8z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M4 8l2-3h12l2 3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+              <span>远程协助</span>
+              <span class="chev" aria-hidden="true">⌃</span>
+            </button>
+            <button class="nav-item active" data-page="assist" type="button">
+              <span class="dot" aria-hidden="true"></span>
+              <span>开始协助</span>
+            </button>
+            <button class="nav-item" data-page="favorites" type="button">
+              <span class="dot" aria-hidden="true"></span>
+              <span>收藏设备</span>
+            </button>
+          </div>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="conn-state" id="connState" data-state="offline">
+            <span class="conn-dot" aria-hidden="true"></span>
+            <span id="connText">未连接信令</span>
+          </div>
+          <button class="nav-item" data-page="settings" type="button">
+            <svg class="nav-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <span>设置</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- --------------------------------------------------------- content -->
+      <main class="content">
+        <header class="page-head">
+          <h1 id="pageTitle">远程协助</h1>
+          <p class="page-sub" id="pageSub">让其他设备协助或控制本机，也可以主动连接伙伴设备</p>
+        </header>
+
+        <!-- ------------------------------------------------ assist page -->
+        <section class="page" id="page-assist">
+          <article class="card">
+            <div class="card-row">
+              <div>
+                <h2>本设备</h2>
+                <p class="card-sub">对方输入下方设备 ID 即可远程协助本机</p>
+              </div>
+              <label class="switch">
+                <input id="allowRemote" type="checkbox" checked />
+                <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+                <span class="switch-label">允许他人远程协助</span>
+              </label>
+            </div>
+
+            <div class="device-grid">
+              <div class="device-field">
+                <span class="field-label">本机识别码</span>
+                <div class="device-id-row">
+                  <span class="device-id" id="deviceId">--- --- ---</span>
+                  <button class="icon-btn" id="btnCopyShare" type="button" title="复制识别码与验证码" aria-label="复制识别码与验证码">
+                    <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+                      <rect x="9" y="9" width="11" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+                      <path d="M15 5.6A2.6 2.6 0 0012.4 3H6.6A2.6 2.6 0 004 5.6v5.8A2.6 2.6 0 006.6 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                </div>
+                <span class="field-hint" id="deviceHint">等待信令服务器分配</span>
+              </div>
+
+              <div class="device-field">
+                <div class="verify-head">
+                  <button class="verify-mode-btn" id="verifyModeBtn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span id="verifyModeLabel">单次验证码</span>
+                    <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                      <path d="M6 9.5l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
+                  <div class="verify-menu" id="verifyMenu" role="listbox" hidden>
+                    <button type="button" role="option" data-mode="long">长期验证码</button>
+                    <button type="button" role="option" data-mode="daily">今日验证码</button>
+                    <button type="button" role="option" data-mode="once">单次验证码</button>
+                  </div>
+                </div>
+                <div class="device-id-row">
+                  <code class="device-id device-code" id="accessCode">••••••</code>
+                  <button class="icon-btn" id="btnToggleCode" type="button" title="显示验证码" aria-label="显示验证码">
+                    <svg id="eyeIcon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path d="M2.6 12S6.5 5.8 12 5.8 21.4 12 21.4 12 17.5 18.2 12 18.2 2.6 12 2.6 12z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+                      <circle cx="12" cy="12" r="2.9" fill="none" stroke="currentColor" stroke-width="1.7" />
+                    </svg>
+                  </button>
+                </div>
+                <span class="field-hint" id="verifyHint">每次启动换一个，用完即换</span>
+              </div>
+            </div>
+
+            <div class="lan-row" id="lanField" hidden>
+              <span class="field-label">手机端「信令服务器」填</span>
+              <span class="lan-address" id="lanAddress">—</span>
+              <button class="icon-btn" id="btnCopyLan" type="button" title="复制局域网地址" aria-label="复制局域网地址">
+                <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+                  <rect x="9" y="9" width="11" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <path d="M15 5.6A2.6 2.6 0 0012.4 3H6.6A2.6 2.6 0 004 5.6v5.8A2.6 2.6 0 006.6 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="lan-row handover-row">
+              <label class="switch">
+                <input id="handOverDisplay" type="checkbox" checked />
+                <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+                <span class="switch-label">让出显示器</span>
+              </label>
+              <span class="field-hint" id="handoverHint">被控时切到控制端分辨率，结束后自动恢复</span>
+            </div>
+
+            <div class="lan-row handover-row">
+              <label class="switch">
+                <input id="blackOutScreen" type="checkbox" />
+                <span class="track" aria-hidden="true"><span class="thumb"></span></span>
+                <span class="switch-label">会话时黑屏</span>
+              </label>
+              <span class="field-hint" id="blackoutHint">把本机亮度调到 0；需要显示器支持 DDC/CI，笔记本内屏通常不行</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-row">
+              <div>
+                <h2>远控伙伴设备</h2>
+                <p class="card-sub">Windows 之间可互相控制；手机与平板只能作为控制端发起连接</p>
+              </div>            </div>
+
+            <div class="connect-row">
+              <input id="peerCode" class="input code" inputmode="numeric" maxlength="13" placeholder="请输入设备 ID" autocomplete="off" spellcheck="false" />
+              <input id="peerPass" class="input pass" type="password" maxlength="16" placeholder="设备验证码" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+              <button class="btn primary" id="btnConnect" type="button">连接</button>
+              <button class="btn ghost" id="btnFavCurrent" type="button" title="收藏当前设备 ID">收藏</button>
+            </div>
+            <p class="inline-msg" id="connectMsg" hidden></p>
+          </article>
+
+          <article class="card" id="recentCard" hidden>
+            <div class="card-row">
+              <div><h2>最近连接</h2></div>
+            </div>
+            <div class="fav-list" id="recentList"></div>
+          </article>
+        </section>
+
+        <!-- --------------------------------------------- favorites page -->
+        <section class="page" id="page-favorites" hidden>
+          <article class="card">
+            <div class="card-row">
+              <div>
+                <h2>收藏设备</h2>
+                <p class="card-sub">保存常用设备，一键发起连接</p>
+              </div>
+            </div>
+            <div class="fav-list" id="favList"></div>
+            <p class="empty" id="favEmpty">还没有收藏设备。在「开始协助」中连接后点击收藏。</p>
+          </article>
+        </section>
+
+        <!-- ---------------------------------------------- settings page -->
+        <section class="page" id="page-settings" hidden>
+          <article class="card">
+            <div class="card-row"><div><h2>连接</h2><p class="card-sub">信令服务器负责交换连接信息，跨公网时必须填写公网地址</p></div></div>
+            <div class="settings-grid">
+              <label class="field">
+                <span class="field-label">信令服务器</span>
+                <input id="signalHost" class="input" type="text" placeholder="127.0.0.1 或公网 IP / 域名" spellcheck="false" />
+              </label>
+              <label class="field narrow">
+                <span class="field-label">TCP 端口</span>
+                <input id="signalPort" class="input" type="number" min="1" max="65535" />
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button class="btn primary" id="btnSaveSignal" type="button">保存并重连</button>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-row"><div><h2>画质</h2><p class="card-sub" id="displayInfo">—</p></div></div>
+            <div class="chips" id="qualityChips">
+              <button class="chip" data-preset="office"><strong>办公</strong><span>6 Mbps</span></button>
+              <button class="chip" data-preset="balanced"><strong>平衡</strong><span>12 Mbps</span></button>
+              <button class="chip" data-preset="game"><strong>游戏</strong><span>25 Mbps</span></button>
+              <button class="chip" data-preset="uhd"><strong>4K60</strong><span>45 Mbps</span></button>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-row"><div><h2>安全</h2><p class="card-sub">验证码用于确认对方身份，请只告知信任的人</p></div></div>
+            <label class="field">
+              <span class="field-label">长期验证码</span>
+              <div class="connect-row tight">
+                <div class="password-field">
+                  <input id="password" class="input" type="password" maxlength="16" placeholder="4–16 位数字或字母，区分大小写" autocomplete="off" spellcheck="false" />
+                  <button class="icon-btn password-eye" id="btnTogglePassword" type="button" title="显示长期验证码" aria-label="显示长期验证码">
+                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path d="M2.6 12S6.5 5.8 12 5.8 21.4 12 21.4 12 17.5 18.2 12 18.2 2.6 12 2.6 12z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+                      <circle cx="12" cy="12" r="2.9" fill="none" stroke="currentColor" stroke-width="1.7" />
+                    </svg>
+                  </button>
+                </div>
+                <button class="btn ghost" id="btnSavePassword" type="button">保存</button>
+              </div>
+              <span class="field-hint">仅在选择「长期验证码」时生效；单次与今日验证码由本机自动生成</span>
+            </label>
+          </article>
+
+          <article class="card">
+            <div class="card-row"><div><h2>运行日志</h2></div></div>
+            <div class="log" id="logList"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <!-- ------------------------------------------------- session overlay -->
+    <div class="session" id="sessionLayer" hidden>
+      <div class="session-top">
+        <div class="session-meta">
+          <span class="badge" id="routeBadge">P2P 直连</span>
+          <span class="peer-name" id="peerName">—</span>
+          <code class="sas" id="sasCode">—</code>
+        </div>
+        <div class="session-actions">
+          <button class="icon-btn" id="btnKeyframe" title="请求关键帧" aria-label="请求关键帧">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 12a8 8 0 11-2.3-5.6M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="icon-btn" id="btnFullscreen" title="全屏" aria-label="全屏">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+          <button class="icon-btn danger" id="btnHangup" title="断开" aria-label="断开">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="stage" id="stage" tabindex="0">
+        <canvas id="screen"></canvas>
+        <div class="stage-overlay" id="stageOverlay">
+          <div class="spinner" aria-hidden="true"></div>
+          <p id="overlayText">正在建立安全连接…</p>
+        </div>
+        <div class="hud">
+          <div class="hud-pill"><span class="hud-label">FPS</span><span id="hudFps">—</span></div>
+          <div class="hud-pill"><span class="hud-label">延迟</span><span id="hudLatency">—</span></div>
+          <div class="hud-pill"><span class="hud-label">码率</span><span id="hudBitrate">—</span></div>
+          <div class="hud-pill"><span class="hud-label">丢包</span><span id="hudLoss">—</span></div>
+        </div>
+        <div class="hud-hint" id="captureHint">点击画面以捕获键鼠</div>
+      </div>
+    </div>
+
+    <!-- ----------------------------------------------------- request modal -->
+    <div class="modal-backdrop" id="requestModal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="requestTitle">
+        <div class="modal-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 3a9 9 0 100 18 9 9 0 000-18zm0 5v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </div>
+        <h2 id="requestTitle">收到远程协助请求</h2>
+        <p class="modal-sub" id="requestBody">请确认对方身份后再允许。</p>
+        <dl class="meta">
+          <div><dt>设备</dt><dd id="requestName">—</dd></div>
+          <div><dt>设备 ID</dt><dd id="requestCode">—</dd></div>
+          <div><dt>系统</dt><dd id="requestOs">—</dd></div>
+        </dl>
+        <p class="verify-note verify-note-code">
+          <span>本机验证码</span>
+          <code class="access-code" id="requestAccessCode">———</code>
+        </p>
+        <p class="verify-note">请与对方核对验证码一致后再允许。</p>
+        <div class="modal-actions">
+          <button class="btn ghost" id="btnDecline" type="button">拒绝</button>
+          <button class="btn primary" id="btnAccept" type="button">允许协助</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+
+    <!-- --------------------------------------------- host mini panel -->
+    <div class="host-panel" id="hostPanel">
+      <div class="host-bar">
+        <span class="host-dot" aria-hidden="true"></span>
+        <span class="host-title">正在被控</span>
+        <span class="host-peer" id="hostPeer">—</span>
+        <button class="host-expand" id="btnHostExpand" type="button" hidden>展开</button>
+      </div>
+      <div class="host-detail">
+        <div class="host-stats">
+          <span><i>FPS</i><b id="hostFps">—</b></span>
+          <span><i>延迟</i><b id="hostLatency">—</b></span>
+          <span><i>码率</i><b id="hostBitrate">—</b></span>
+        </div>
+        <div class="host-lines">
+          <span class="host-route" id="hostRoute">P2P 直连</span>
+          <code class="host-sas" id="hostSas">SAS —</code>
+        </div>
+        <div class="host-foot">
+          <button class="btn ghost small" id="btnHostCollapse" type="button">收起</button>
+          <button class="btn danger small" id="btnHostHangup" type="button">断开</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

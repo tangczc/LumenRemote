@@ -1,0 +1,51 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+out-build/
+.electron-dist/
+# 引擎打包产物（npm run build:engine 生成）
+build/
+# 安装包 / APK，体积大，随 Release 单独提供
+release/
+
+# ---- Android / Gradle ----
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/build/
+android/build/
+*.apk
+*.aab
+
+# ---- 本地文档（不进仓库）----
+docs/
+
+# ---- 二进制依赖 ----
+# 打包用 ffmpeg.exe（约 220 MB，含 NVENC/libx264），按 README 自行放入 vendor/ffmpeg/
+vendor/
+
+# ---- 运行期状态 / 抓包样本 ----
+.rd-state/
+.rd-state-*/
+*.h264
+*.log
+
+# ---- 本机私密文件（服务器凭据等，绝不能提交）----
+Ubuntu
+*.pem
+*.key
+secrets*
+.env
+.env.*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+# ---- 本机调试残留（uiautomator dump / 模拟器日志 / 截图）----
+*.err
+android/ua.xml
+android/ub.xml
+android/*.png

@@ -1,0 +1,74 @@
+{
+  "name": "remote-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/desktop/main.cjs",
+  "description": "Low-latency remote desktop / game streaming (Windows desktop client + engine)",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/protocol.test.ts tests/transport.test.ts tests/media.test.ts tests/net.test.ts tests/code.test.ts tests/display.test.ts tests/relay.test.ts tests/relay-forward.test.ts",
+    "build:engine": "node scripts/build-engine.mjs",
+    "desktop": "npm run build:engine && electron .",
+    "dist": "npm run build:engine && electron-builder --win",
+    "signal": "tsx src/signaling/main.ts",
+    "app": "tsx src/app/main.ts",
+    "bench": "tsx src/bench/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "build": {
+    "appId": "com.lumen.remote",
+    "productName": "Lumen Remote",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "src/desktop/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "build",
+        "to": "engine",
+        "filter": [
+          "*.mjs",
+          "ui/**",
+          "host/**",
+          "ffmpeg/**",
+          "icon.png"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "artifactName": "LumenRemote-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Lumen Remote",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
