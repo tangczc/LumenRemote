@@ -34,6 +34,7 @@ import { startUiServer, type UiServer } from '../ui/server.ts';
 import { openUi } from '../ui/open.ts';
 import { ffmpegAvailable, ffmpegBinary } from '../util/resources.ts';
 import {
+  NET_OVERHEAD,
   QUALITY_PRESETS,
   encodeVideoPacket,
   type AppToUi,
@@ -268,6 +269,11 @@ let controllerSize = { width: display.width, height: display.height };
 let pendingEph: EphemeralKeyPair | null = null;
 let pendingRole: 'host' | 'controller' = 'host';
 let lastKeyframeRestart = 0;
+/** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
+let adaptedBitrateKbps = 0;
+let lastBitrateAdaptAt = 0;
+/** Pending mid-session resize from the controller, debounced before the encoder restarts. */
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 /**
  * True while the session runs over the relay: the encoder is capped because the
  * media has to cross two WAN legs plus a shared server.
@@ -409,7 +415,13 @@ function startEncoder(target: ActiveSession): void {
   const { width, height, scaled } = negotiateSize(display, peerDisplay);
   const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
-  const bitrateKbps = scaled ? scaleBitrate(presetKbps, display, { width, height }) : presetKbps;
+  let bitrateKbps = scaled ? scaleBitrate(presetKbps, display, { width, height }) : presetKbps;
+  // The congestion controller's verdict, learned from the wire: never let the
+  // encoder produce faster than the path has proven it can carry. Without
+  // this the encoder kept emitting the full preset rate into a saturated
+  // pacer, which dropped frames, broke reference chains and forced an
+  // encoder restart every second — the visible "卡得要死" death spiral.
+  if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source: values.source === 'test' ? { kind: 'test', size: `${display.width}x${display.height}` } : { kind: 'screen', mode: 'auto' },
@@ -426,8 +438,11 @@ function startEncoder(target: ActiveSession): void {
       try {
         const sent = active.session.sendFrame(Codec.H264, au.isKey ? FrameFlags.Key : 0, au.payload);
         // A shed frame breaks the reference chain, so the decoder would show
-        // corruption until the next IDR. Ask for one instead of waiting.
-        if (sent < 0 && Date.now() - lastKeyframeRestart > 1000) {
+        // corruption until the next IDR. Ask for one instead of waiting — but
+        // at most every 5 s: restarting the whole capture pipeline is itself
+        // hundreds of milliseconds of stall, and doing it every second made
+        // congestion self-sustaining.
+        if (sent < 0 && Date.now() - lastKeyframeRestart > 5000) {
           lastKeyframeRestart = Date.now();
           active.encoder?.stop();
           startEncoder(active);
@@ -752,6 +767,12 @@ async function startSession(
     password: msg.password,
   });
   autoRestarts = 0;
+  adaptedBitrateKbps = 0;
+  lastBitrateAdaptAt = 0;
+  if (resizeTimer) {
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+  }
 
   const session = new Session({
     role,
@@ -769,6 +790,30 @@ async function startSession(
         endSession(ctl.reason ?? '对方已断开');
         return;
       }
+      if (ctl.t === 'resize' && role === 'host' && active) {
+        // The controller resized its window or entered/left fullscreen. The
+        // encode size was previously fixed at connect time, so fullscreen
+        // kept showing the small pre-fullscreen stream. Re-negotiate — but
+        // debounce, because a window drag reports dozens of sizes, and do
+        // NOT switch the physical panel mid-session: the flicker and DPI
+        // reshuffle would move every window under the user's hand. Scaling
+        // the encoder output is enough.
+        const w = Math.round(ctl.width);
+        const h = Math.round(ctl.height);
+        if (w >= 160 && h >= 120 && w <= 7680 && h <= 4320) {
+          if (resizeTimer) clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => {
+            resizeTimer = null;
+            if (!active || active.role !== 'host') return;
+            if (peerDisplay && Math.abs(peerDisplay.width - w) < 16 && Math.abs(peerDisplay.height - h) < 16) return;
+            peerDisplay = { width: w, height: h, fps: ctl.fps };
+            log('info', `对方视口变化 ${w}x${h}，调整编码尺寸`);
+            active.encoder?.stop();
+            startEncoder(active);
+          }, 350);
+        }
+        return;
+      }
       if (ctl.t !== 'idr' || role !== 'host' || !active) return;
       const now = Date.now();
       if (now - lastKeyframeRestart > 2000) {
@@ -778,7 +823,25 @@ async function startSession(
       }
     },
     onStats: (s) => sendUi({ type: 'stats', stats: toDto(s) }),
-    onBitrateChange: (bps) => log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`),
+    onBitrateChange: (bps) => {
+      log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`);
+      // Feed the congestion verdict back into the encoder (debounced, and
+      // only on a material change): pacing alone cannot fix an encoder that
+      // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
+      if (!active || active.role !== 'host' || !active.encoder) return;
+      const now = Date.now();
+      if (now - lastBitrateAdaptAt < 4000) return;
+      const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
+      const current = adaptedBitrateKbps > 0 ? adaptedBitrateKbps : preset.bitrateKbps;
+      const drop = kbps < current * 0.7;
+      const recover = adaptedBitrateKbps > 0 && kbps > current * 1.4;
+      if (!drop && !recover) return;
+      lastBitrateAdaptAt = now;
+      adaptedBitrateKbps = kbps;
+      log('info', `按网络状况调整编码码率至 ${kbps} kbps`);
+      active.encoder.stop();
+      startEncoder(active);
+    },
   });
   session.start();
   session.sendHello({
@@ -953,6 +1016,14 @@ function handleUi(msg: UiToApp): void {
     case 'client-display':
       if (msg.width > 0 && msg.height > 0) {
         controllerSize = { width: Math.round(msg.width), height: Math.round(msg.height) };
+        // Mid-session (window resize, entering/leaving fullscreen) the host
+        // must hear about it, otherwise it keeps encoding for the size the
+        // window had at connect time and fullscreen shows that small,
+        // blurry picture. Previously this only updated a local variable
+        // that nothing read until the NEXT connection.
+        if (active?.role === 'controller') {
+          active.session.sendControl({ t: 'resize', width: controllerSize.width, height: controllerSize.height, fps: preset.fps });
+        }
       }
       break;
     case 'input':

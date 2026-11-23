@@ -98,9 +98,15 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   // ddagrab hands the encoder D3D11 surfaces, which no scaler can consume, so a
   // resize has to round-trip through system memory. That costs one core at
   // 4K->1440p, which is why the native size is kept whenever it already fits.
+  // draw_mouse=0 on both capture paths: the cursor is NOT baked into the
+  // video. A baked-in cursor only moves when a frame arrives, so under any
+  // lag it trails the controller's real pointer, appears in whatever shape
+  // the host last used, and clicks seem to land "somewhere else". The
+  // controller renders its own local cursor instantly instead (see the
+  // stage canvas CSS), which is how commercial remote-desktop tools do it.
   const ddaChain = scaleFilter
-    ? `ddagrab=framerate=${fps},hwdownload,format=bgra,${scaleFilter},format=nv12`
-    : `ddagrab=framerate=${fps}`;
+    ? `ddagrab=framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter},format=nv12`
+    : `ddagrab=framerate=${fps}:draw_mouse=0`;
 
   const input =
     opts.source.kind === 'screen'
@@ -113,7 +119,7 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
             '-framerate',
             String(fps),
             '-draw_mouse',
-            '1',
+            '0',
             '-i',
             'desktop',
             ...(scaleFilter ? ['-vf', scaleFilter] : []),

@@ -983,13 +983,30 @@ body {
 
 .stage canvas {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
-  /* The host paints its own cursor into the video, so a second local one only
-     makes the pointer look duplicated and laggy. */
-  cursor: none;
+  /* Fill the stage (in fullscreen: the whole screen). With `object-fit:
+     contain` the picture keeps the host's aspect ratio and letterboxes
+     instead of cropping, so the ENTIRE host screen is always visible.
+     The old `width/height: auto` never upscaled past the frame's intrinsic
+     size, which is why fullscreen still showed a small picture in the
+     middle of a big monitor. The input mapping accounts for the
+     letterbox (see displayedVideoRect in app.js). */
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  /* The cursor is rendered locally (the encoder no longer bakes the host
+     cursor into the video), so it must be a normal visible arrow that
+     tracks the hand with zero latency — `cursor: none` here left users
+     with no usable pointer at all whenever the baked-in cursor lagged
+     or was absent. */
+  cursor: default;
+}
+
+/* True fullscreen: hide the session chrome so the stage IS the screen. */
+.session:fullscreen {
+  grid-template-rows: minmax(0, 1fr);
+}
+.session:fullscreen .session-top {
+  display: none;
 }
 
 .stage-overlay {

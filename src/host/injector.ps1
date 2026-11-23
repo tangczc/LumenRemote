@@ -57,6 +57,7 @@ public static class RDInject
 
     private const uint MOVE = 0x0001;
     private const uint ABSOLUTE = 0x8000;
+    private const uint VIRTUALDESK = 0x4000;
     private const uint LB_DOWN = 0x0002, LB_UP = 0x0004;
     private const uint RB_DOWN = 0x0008, RB_UP = 0x0010;
     private const uint MB_DOWN = 0x0020, MB_UP = 0x0040;
@@ -105,7 +106,12 @@ public static class RDInject
         SendInput((uint)batch.Length, batch, Size);
     }
 
-    public static void MoveAbsolute(int nx, int ny) { Send(MouseInput(MOVE | ABSOLUTE, nx, ny, 0)); }
+    // VIRTUALDESK: without it SendInput normalises 0..65535 onto the primary
+    // monitor only, so on any multi-monitor host (or a primary that is not at
+    // the virtual desktop's origin) every click lands offset from where the
+    // controller pointed — capture (gdigrab "desktop") spans the whole
+    // virtual desktop, so injection must use the same coordinate space.
+    public static void MoveAbsolute(int nx, int ny) { Send(MouseInput(MOVE | ABSOLUTE | VIRTUALDESK, nx, ny, 0)); }
 
     public static void Button(int button, bool down)
     {
