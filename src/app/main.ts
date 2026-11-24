@@ -338,6 +338,15 @@ let lastBitrateAdaptAt = 0;
 let pendingRecoverAt = 0;
 /** Last congestion verdict seen (bps), re-run by the stats heartbeat. */
 let lastVerdictBps = 0;
+/**
+ * Input-path counters for the stats heartbeat. Three checkpoints —
+ * controller UI sent / host received / host injected — let one log
+ * export say exactly where a dead click stopped travelling.
+ */
+let inputReceived = 0;
+let inputClicksReceived = 0;
+let inputForwarded = 0;
+let inputClicksForwarded = 0;
 /** Pending mid-session resize from the controller, debounced before the encoder restarts. */
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 /**
@@ -562,9 +571,16 @@ function aimInjector(): void {
   if (!active || active.role !== 'host') return;
   const sel = hostDisplays[active.displayIndex];
   if (!sel) return;
+  const virtual = virtualBounds(hostDisplays);
   injector.setTarget(
     { x: sel.x, y: sel.y, width: sel.width, height: sel.height },
-    virtualBounds(hostDisplays),
+    virtual,
+  );
+  // Logged on every (re)aim so a post-mortem export shows which
+  // geometry pointer mapping was actually using at the time.
+  log(
+    'info',
+    `鼠标注入瞄准 屏幕 ${sel.index + 1} ${sel.width}x${sel.height}@${sel.x},${sel.y} · 虚拟桌面 ${virtual.width}x${virtual.height}@${virtual.x},${virtual.y} · 共 ${hostDisplays.length} 块屏`,
   );
 }
 
@@ -1191,6 +1207,10 @@ async function startSession(
   lastBitrateAdaptAt = 0;
   pendingRecoverAt = 0;
   lastVerdictBps = 0;
+  inputReceived = 0;
+  inputClicksReceived = 0;
+  inputForwarded = 0;
+  inputClicksForwarded = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
     resizeTimer = null;
@@ -1270,7 +1290,11 @@ async function startSession(
     initialBitrateBps: Math.min(preset.netKbps * 1000, START_NET_BPS),
     maxBitrateBps: preset.netKbps * 1000,
     logger: logger.child('session'),
-    onInput: (event) => injector.inject(event),
+    onInput: (event) => {
+      inputReceived++;
+      if (event.k === 'mb' && event.down) inputClicksReceived++;
+      injector.inject(event);
+    },
     onFrame: (frame) => onIncomingFrame(frame),
     onControl: (ctl) => {
       lastPeerAt = Date.now();
@@ -1350,6 +1374,7 @@ async function startSession(
               await releasePanel('（主控请求真4K）');
               if (!active || active.role !== 'host') return;
               hostDisplays = await listDisplays(preset.fps);
+              log('info', `恢复原生后面板：${hostDisplays.map(displayLabel).join(' · ')}（共 ${hostDisplays.length} 块屏）`);
               // Re-aim the injector at the restored panel: absolute
               // pointer mapping runs through the display rectangle, and
               // the restore just changed it (2560x1440 -> 3840x2160,
@@ -1405,6 +1430,13 @@ async function startSession(
         `send=${(s.sendBps / 1e6).toFixed(2)}M recv=${(s.recvBps / 1e6).toFixed(2)}M ` +
         `queue=${s.queueBytes}B pending=${s.pendingFrames} drop=${s.droppedFrames} skip=${s.skippedFrames} ` +
         `fec=${s.recoveredFrames} rxpkts=${s.packetsReceived} authfail=${s.authFailures}`;
+      // Input checkpoints (see counters above): a dead-click report is
+      // answerable by comparing clicksSent (controller) with clicks
+      // (host) and injDrop — no more guessing which hop ate the input.
+      lastStatsLine +=
+        s.role === 'host'
+          ? ` in=${inputReceived} clicks=${inputClicksReceived} inj=${injector.running ? 'on' : 'off'} injDrop=${injector.droppedEvents}`
+          : ` inSent=${inputForwarded} clicksSent=${inputClicksForwarded}`;
       logger.info('stats', lastStatsLine);
     },
     onBitrateChange: (bps) => {
@@ -1639,7 +1671,11 @@ function handleUi(msg: UiToApp): void {
       }
       break;
     case 'input':
-      if (active?.role === 'controller' && isInputEvent(msg.event)) active.session.sendInput(msg.event);
+      if (active?.role === 'controller' && isInputEvent(msg.event)) {
+        inputForwarded++;
+        if (msg.event.k === 'mb' && msg.event.down) inputClicksForwarded++;
+        active.session.sendInput(msg.event);
+      }
       break;
     case 'set-allow':
       state = { ...state, allowRemote: msg.enabled };

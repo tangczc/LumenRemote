@@ -81,6 +81,8 @@ export class InputInjector {
   private dropped = 0;
   private stopped = false;
   private lastStartAttempt = 0;
+  /** Wire line of the most recent absolute move, for click logging. */
+  private lastAbsLine = '';
   /** Display the controller is looking at, and the desktop it sits in. */
   private target: { rect: DisplayRect; virtual: DisplayRect } | null = null;
 
@@ -105,6 +107,7 @@ export class InputInjector {
     const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT];
     const proc = spawn(shell, args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
     this.proc = proc;
+    this.opts.log?.('info', '输入注入器已启动');
     proc.stderr?.on('data', (c: Buffer) => {
       const text = c.toString('utf8').trim();
       if (text) this.opts.log?.('warn', `injector: ${text.slice(0, 200)}`);
@@ -133,12 +136,26 @@ export class InputInjector {
         this.start();
       }
       if (!this.proc?.stdin?.writable) {
+        if (this.dropped === 0) {
+          this.opts.log?.('warn', '输入注入不可用：辅助进程未运行，输入事件开始被丢弃');
+        }
         this.dropped++;
         return;
       }
     }
     const line = toLine(event, this.target);
     if (!line) return;
+    if (event.k === 'ma') this.lastAbsLine = line;
+    if (event.k === 'mb') {
+      // One line per click: the mapped position it follows, and the
+      // geometry it was mapped through. Together with the controller's
+      // "点击发送" line this proves (or clears) the mapping hop.
+      const t = this.target;
+      this.opts.log?.(
+        'info',
+        `注入${event.down ? '按下' : '抬起'} b=${event.b} · 位置 ${this.lastAbsLine || '(无先行移动)'} · 目标屏 ${t ? `${t.rect.width}x${t.rect.height}@${t.rect.x},${t.rect.y}` : '(未瞄准)'} · 虚拟桌面 ${t ? `${t.virtual.width}x${t.virtual.height}@${t.virtual.x},${t.virtual.y}` : '(无)'}`,
+      );
+    }
     try {
       this.proc.stdin.write(`${line}\n`);
     } catch {
