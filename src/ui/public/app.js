@@ -53,7 +53,27 @@ function fmtMs(ms) {
   return `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
 }
 
+/* Browser-side log lines, retained for the 导出日志 bundle: the engine log
+ * alone cannot show decoder errors or WebCodecs complaints. */
+const clientLogLines = [];
+function rememberLog(level, message) {
+  const stamp = new Date().toISOString();
+  clientLogLines.push(`${stamp} [${level}] ${message}`);
+  if (clientLogLines.length > 1000) clientLogLines.shift();
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 function logLine(level, message) {
+  rememberLog(level, message);
   const host = $('#logList');
   if (!host) return;
   const row = document.createElement('div');
@@ -291,6 +311,11 @@ function handleServer(msg) {
 
     case 'log':
       logLine(msg.level, msg.message);
+      break;
+
+    case 'log-bundle':
+      downloadText(msg.filename || 'lumen-logs.txt', msg.text || '');
+      toast('日志已下载，把这个文件发给开发者即可');
       break;
 
     case 'notice':
@@ -889,6 +914,20 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#btnExportLogs')?.addEventListener('click', () => {
+    const header = [
+      `浏览器 ${navigator.userAgent}`,
+      `页面 ${location.href} · 时间 ${new Date().toISOString()}`,
+      `解码器 ${state.decoderState ?? '(未建立)'}`,
+    ].join('\n');
+    const clientLog = `${header}\n${clientLogLines.join('\n')}`;
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      send({ type: 'export-logs', clientLog });
+    } else {
+      // Engine unreachable: still hand the user the browser half.
+      downloadText(`lumen-ui-logs-${Date.now()}.txt`, clientLog);
+    }
+  });
   for (const btn of $$('.nav-item')) {
     btn.addEventListener('click', () => showPage(btn.dataset.page));
   }

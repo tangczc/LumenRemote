@@ -129,6 +129,11 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.lumen.remote.util.LLog.init(this)
+        com.lumen.remote.util.LLog.i(
+            "应用",
+            "=== Lumen Remote 启动 · ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT}) ===",
+        )
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         root = FrameLayout(this)
         homeView = buildHome()
@@ -230,10 +235,25 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
             android.os.Build.HARDWARE.contains("ranchu", ignoreCase = true)
 
     private fun appendLog(line: String) {
-        android.util.Log.i("LumenRemote", line)
+        com.lumen.remote.util.LLog.i("界面", line)
         val existing = logText.text?.toString().orEmpty()
         val merged = if (existing.isEmpty()) line else "$existing\n$line"
-        logText.text = merged.takeLast(600)
+        logText.text = merged.takeLast(20000)
+    }
+
+    /** One-tap diagnosis bundle: hand the log file to any share target. */
+    private fun exportLogs() {
+        val header = listOf(
+            "Lumen Remote 日志导出（Android）",
+            "生成时间 ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}",
+            "设备 ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+        ).joinToString("\n")
+        val share = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "Lumen Remote 日志")
+            putExtra(android.content.Intent.EXTRA_TEXT, com.lumen.remote.util.LLog.exportText(header))
+        }
+        startActivity(android.content.Intent.createChooser(share, "导出日志"))
     }
 
     // ------------------------------------------------------------------- home
@@ -336,6 +356,11 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
         right.addView(spacer(this, 16f))
         logText = body("", Theme.TEXT_DIM, 10.5f)
         right.addView(logText)
+
+        right.addView(spacer(this, 10f))
+        val exportButton = ghostButton("导出日志")
+        exportButton.setOnClickListener { exportLogs() }
+        right.addView(exportButton)
 
         applyHomeLayout()
 

@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { platform, hostname } from 'node:os';
+import { platform, hostname, arch } from 'node:os';
 import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -33,6 +33,7 @@ import {
 import { startUiServer, type UiServer } from '../ui/server.ts';
 import { openUi } from '../ui/open.ts';
 import { ffmpegAvailable, ffmpegBinary } from '../util/resources.ts';
+import { AppLogger, installCrashHandlers, parseLogLevel } from '../util/log.ts';
 import {
   NET_OVERHEAD,
   QUALITY_PRESETS,
@@ -98,6 +99,8 @@ const { values } = parseArgs({
     'no-upnp': { type: 'boolean', default: false },
     'no-candidates': { type: 'boolean', default: false },
     'force-relay': { type: 'boolean', default: false },
+    'log-level': { type: 'string', default: '' },
+    'log-dir': { type: 'string', default: '' },
     help: { type: 'boolean', default: false },
   },
 });
@@ -120,6 +123,8 @@ Lumen Remote — unified remote-control client
   --no-upnp           skip router port mapping (NAT-PMP / UPnP)
   --no-candidates     advertise no P2P candidates; forces the relay (debug)
   --force-relay       ignore the peer's candidates and use the relay (debug)
+  --log-level <lvl>   debug|info|warn|error (default info; env RD_LOG_LEVEL)
+  --log-dir <path>    log directory (default <state>/logs; env RD_LOG_DIR)
 `);
   process.exit(0);
 }
@@ -127,6 +132,24 @@ Lumen Remote — unified remote-control client
 const DEVICE_NAME = values.name || hostname();
 const STATE_DIR = process.env.RD_STATE_DIR || join(process.cwd(), '.rd-state');
 const STATE_FILE = join(STATE_DIR, 'app-state.json');
+
+// Full-fidelity logging: structured lines to <state>/logs/lumen.log (5 MB x 5
+// rotation) plus the console and UI mirrors below. When something goes wrong
+// the user exports this from the UI log card and sends the file over as-is.
+const LOG_DIR = values['log-dir'] || process.env.RD_LOG_DIR || join(STATE_DIR, 'logs');
+const logger = new AppLogger({
+  dir: LOG_DIR,
+  name: 'lumen',
+  level: parseLogLevel(values['log-level'] || process.env.RD_LOG_LEVEL),
+  consoleEcho: true,
+});
+installCrashHandlers(logger);
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    logger.warn('app', `收到 ${signal}，进程退出`);
+    process.exit(0);
+  });
+}
 
 interface AppState {
   deviceId: string;
@@ -226,8 +249,7 @@ const sendUi = (msg: AppToUi): void => {
 };
 
 const log = (level: 'info' | 'warn' | 'error', message: string): void => {
-  const stamp = new Date().toISOString().slice(11, 23);
-  console.log(`${stamp} [${level}] ${message}`);
+  logger.log(level, 'app', message);
   sendUi({ type: 'log', level, message, ts: Date.now() });
 };
 
@@ -284,6 +306,9 @@ let controllerSize = { width: display.width, height: display.height };
 let pendingEph: EphemeralKeyPair | null = null;
 let pendingRole: 'host' | 'controller' = 'host';
 let lastKeyframeRestart = 0;
+/** Last stats snapshot written to the log file, and when (10 s cadence). */
+let lastStatsLoggedAt = 0;
+let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
 let lastBitrateAdaptAt = 0;
@@ -298,6 +323,19 @@ let relayBudget = false;
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
 const decodeInUi = values.display === 'ui';
+
+logger.info(
+  'app',
+  `=== Lumen Remote ${VERSION} 启动 · ${platform()} ${arch()} · Node ${process.version} · pid ${process.pid} ===`,
+);
+logger.info(
+  'app',
+  `日志文件 ${logger.filePath} · 级别 ${logger.currentLevel} · 状态目录 ${STATE_DIR}`,
+);
+logger.info(
+  'app',
+  `参数 signal=${state.signalHost}:${state.signalPort} ui=${values.ui} source=${values.source} quality=${state.quality} encoder=${values.encoder} inject=${values.inject} upnp=${!values['no-upnp']} 验证码${values.password ? "(命令行已设置)" : "(未设置)"}`,
+);
 
 const link = await UdpLink.bind({});
 link.setLatch(true);
@@ -742,7 +780,11 @@ function endSession(reason: string): void {
   }
   if (current.role === 'host') void releasePanel(reason);
   sendUi({ type: 'session-end', reason });
-  log('info', `会话结束 ${reason}`);
+  log(
+    'info',
+    `会话结束 ${reason} · 时长 ${Math.max(0, Math.round((Date.now() - current.startedAt) / 1000))}s · 路由 ${current.route}`,
+  );
+  if (lastStatsLine) log('info', `结束时统计 ${lastStatsLine}`);
   rotateOnceCode();
 }
 
@@ -906,7 +948,7 @@ async function startSession(
     sessionId: msg.sessionId,
     initialBitrateBps: Math.min(preset.netKbps * 1000, START_NET_BPS),
     maxBitrateBps: preset.netKbps * 1000,
-    logger: (level, message) => log(level === 'debug' ? 'info' : level, message),
+    logger: logger.child('session'),
     onInput: (event) => injector.inject(event),
     onFrame: (frame) => onIncomingFrame(frame),
     onControl: (ctl) => {
@@ -952,7 +994,24 @@ async function startSession(
         startEncoder(active);
       }
     },
-    onStats: (s) => sendUi({ type: 'stats', stats: toDto(s) }),
+    onStats: (s) => {
+      sendUi({ type: 'stats', stats: toDto(s) });
+      // A 10 s stats heartbeat in the log file is what makes "it stuttered
+      // around 21:40" answerable after the fact: the live UI numbers are
+      // gone the moment the session ends, the file keeps the whole curve.
+      const now = Date.now();
+      if (now - lastStatsLoggedAt < 10_000) return;
+      lastStatsLoggedAt = now;
+      lastStatsLine =
+        `role=${s.role} route=${active?.route ?? '?'} fps=${Math.round(s.fps)} ` +
+        `rtt=${(s.rttUs / 1000).toFixed(1)}ms oneway=${(s.oneWayUs / 1000).toFixed(1)}ms ` +
+        `loss=${s.lossPct}% jitter=${(s.jitterUs / 1000).toFixed(1)}ms ` +
+        `target=${(s.targetBps / 1e6).toFixed(2)}M pacer=${(s.pacerRateBps / 1e6).toFixed(2)}M ` +
+        `send=${(s.sendBps / 1e6).toFixed(2)}M recv=${(s.recvBps / 1e6).toFixed(2)}M ` +
+        `queue=${s.queueBytes}B pending=${s.pendingFrames} drop=${s.droppedFrames} skip=${s.skippedFrames} ` +
+        `fec=${s.recoveredFrames} rxpkts=${s.packetsReceived} authfail=${s.authFailures}`;
+      logger.info('stats', lastStatsLine);
+    },
     onBitrateChange: (bps) => {
       log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`);
       // Feed the congestion verdict back into the encoder (debounced, and
@@ -1110,6 +1169,29 @@ function applyQuality(next: QualityPreset): void {
   log('info', `画质 ${p.label} · ${p.bitrateKbps} kbps`);
 }
 
+/**
+ * Everything a developer needs to diagnose a bad session, in one text file:
+ * environment header, the engine log tail, and the browser-side log the UI
+ * kept. No secrets: access codes and key material are never logged, and the
+ * logger redacts credential-looking assignments on the way in.
+ */
+function buildLogBundle(clientLog?: string): string {
+  const sessionLine = active
+    ? `${active.role} · 对端 ${active.peerName} (${active.peerCode}) · 路由 ${active.route} · 已持续 ${Math.max(0, Math.round((Date.now() - active.startedAt) / 1000))}s`
+    : '无';
+  const header = [
+    'Lumen Remote 日志导出',
+    `生成时间 ${new Date().toISOString()}（本机 ${new Date().toString()}）`,
+    `版本 ${VERSION} · 平台 ${platform()} ${arch()} · Node ${process.version} · pid ${process.pid} · 进程已运行 ${Math.round(process.uptime())}s`,
+    `设备 ${DEVICE_NAME} · 编号 ${deviceCode || '(未上线)'} · 信令 ${state.signalHost}:${state.signalPort} ${signalOnline ? '在线' : '离线'}`,
+    `显示 ${display.width}x${display.height}@${display.fps} · 画质 ${preset.label} ${preset.bitrateKbps}kbps/${preset.fps}fps`,
+    `日志文件 ${logger.filePath} · 级别 ${logger.currentLevel}`,
+    `当前会话 ${sessionLine}`,
+    lastStatsLine ? `最近统计 ${lastStatsLine}` : '最近统计 （无）',
+  ].join('\n');
+  return `${header}\n\n===== 引擎日志（文件尾部） =====\n${logger.exportText()}\n\n===== 界面日志（浏览器） =====\n${clientLog?.trim() ? clientLog.trim() : '（无）'}\n`;
+}
+
 function handleUi(msg: UiToApp): void {
   switch (msg.type) {
     case 'accept':
@@ -1222,6 +1304,16 @@ function handleUi(msg: UiToApp): void {
       saveState(state);
       sendUi({ type: 'favorites', favorites: state.favorites });
       break;
+    case 'export-logs': {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      sendUi({
+        type: 'log-bundle',
+        filename: `lumen-logs-${stamp}.txt`,
+        text: buildLogBundle(msg.clientLog),
+      });
+      log('info', '已导出日志（设置页「运行日志 → 导出日志」）');
+      break;
+    }
     default:
       break;
   }
