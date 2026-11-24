@@ -300,6 +300,10 @@ function handleServer(msg) {
       configureDecoder(msg);
       break;
 
+    case 'displays':
+      renderDisplayPicker(msg.displays ?? [], msg.active ?? 0);
+      break;
+
     case 'stats':
       state.stats = msg.stats;
       renderStats(msg.stats);
@@ -541,8 +545,38 @@ function leaveHostMode() {
   window.lumen?.setHostPanel?.('off');
 }
 
+/**
+ * The host's screens, as reported over the control channel. Only shown
+ * when there is an actual choice: a single-screen host gets no extra UI.
+ * Switching restarts the host's encoder on the picked display; the input
+ * mapping follows it, so the pointer can only ever land on that screen.
+ */
+function renderDisplayPicker(displays, active) {
+  const select = $('#displaySelect');
+  if (!select) return;
+  if (state.session?.role === 'host') {
+    const current = displays.find((d) => d.index === active);
+    if (current) logLine('info', `对方正在查看：屏幕 ${current.index + 1}${current.primary ? '（主屏）' : ''}`);
+    return;
+  }
+  select.replaceChildren();
+  for (const d of displays) {
+    const option = document.createElement('option');
+    option.value = String(d.index);
+    option.textContent = `屏幕 ${d.index + 1}${d.primary ? '（主屏）' : ''} · ${d.width}×${d.height}`;
+    select.appendChild(option);
+  }
+  select.value = String(active);
+  select.hidden = displays.length <= 1;
+}
+
 function exitSession(reason) {
   state.session = null;
+  const select = $('#displaySelect');
+  if (select) {
+    select.hidden = true;
+    select.replaceChildren();
+  }
   state.sessionId = null;
   $('#sessionLayer').hidden = true;
   $('#requestModal').hidden = true;
@@ -914,6 +948,13 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#displaySelect')?.addEventListener('change', (ev) => {
+    const index = Number(ev.target.value);
+    if (Number.isFinite(index)) {
+      send({ type: 'select-display', index });
+      toast(`正在切换到屏幕 ${index + 1}…`);
+    }
+  });
   $('#btnExportLogs')?.addEventListener('click', () => {
     const header = [
       `浏览器 ${navigator.userAgent}`,

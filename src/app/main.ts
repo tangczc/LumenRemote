@@ -21,7 +21,13 @@ import { annexBToAvcc, describeStream, type AvcStreamConfig } from '../media/avc
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
 import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
-import { queryDisplay } from '../host/display.ts';
+import {
+  listDisplays,
+  primaryDisplayIndex,
+  queryDisplay,
+  virtualBounds,
+  type HostDisplay,
+} from '../host/display.ts';
 import {
   handOverDisplay as takeOverDisplay,
   pickDisplayMode,
@@ -45,6 +51,7 @@ import {
   type VerifyMode,
 } from '../ui/bridge.ts';
 import type { Candidate, ServerToClient } from '../signaling/protocol.ts';
+import type { DisplayDescriptor } from '../protocol/messages.ts';
 
 /**
  * Unified remote-control client.
@@ -258,6 +265,8 @@ const log = (level: 'info' | 'warn' | 'error', message: string): void => {
 // Reassigned while a host session owns the panel: the capture size follows the
 // resolution the controller asked for instead of the one the user normally runs.
 let display = await queryDisplay(preset.fps);
+/** Every display attached to this host; refreshed when a host session starts. */
+let hostDisplays: HostDisplay[] = await listDisplays(preset.fps);
 /** Panel state a host session took over, so ending it can put everything back. */
 interface PanelHold {
   layout: DisplayLayout[];
@@ -284,6 +293,8 @@ interface ActiveSession {
   relayEndpoint: { address: string; port: number };
   /** Cancels a background relay->P2P upgrade loop belonging to this session. */
   cancelUpgrade?: () => void;
+  /** Which host display is captured/controlled (host role; index into hostDisplays). */
+  displayIndex: number;
 }
 
 let active: ActiveSession | null = null;
@@ -482,6 +493,80 @@ async function dialledIpAddress(): Promise<string> {
 
 // ------------------------------------------------------------ media pipeline
 
+/** Human label shared by the log and the controller's screen picker. */
+function displayLabel(d: HostDisplay): string {
+  return `屏幕 ${d.index + 1}${d.primary ? '（主屏）' : ''} ${d.width}x${d.height}@${d.refreshRate}Hz`;
+}
+
+function displayDescriptors(): DisplayDescriptor[] {
+  return hostDisplays.map((d) => ({
+    index: d.index,
+    name: d.name,
+    primary: d.primary,
+    width: d.width,
+    height: d.height,
+    refreshRate: d.refreshRate,
+  }));
+}
+
+/**
+ * Point the injector at the display being controlled. Absolute moves are
+ * mapped through that display's rectangle (see frameToVirtual), so input
+ * physically cannot land on another monitor.
+ */
+function aimInjector(): void {
+  if (!active || active.role !== 'host') return;
+  const sel = hostDisplays[active.displayIndex];
+  if (!sel) return;
+  injector.setTarget(
+    { x: sel.x, y: sel.y, width: sel.width, height: sel.height },
+    virtualBounds(hostDisplays),
+  );
+}
+
+/** Tell both the controller (data channel) and this UI what can be picked. */
+function sendDisplayList(): void {
+  if (!active) return;
+  sendUi({ type: 'displays', displays: displayDescriptors(), active: active.displayIndex });
+  if (active.role === 'host') {
+    active.session.sendControl({
+      t: 'displays',
+      displays: displayDescriptors(),
+      active: active.displayIndex,
+    });
+  }
+}
+
+/**
+ * Move capture + control to another display at the controller's request.
+ * Only the selected screen is captured and injected into; other displays
+ * are never touched — in particular the panel takeover (resolution switch
+ * and DDC dimming, which by design affect the primary and every panel's
+ * brightness) is handed back before capture moves off the primary, and is
+ * not re-applied when switching back mid-session.
+ */
+async function switchDisplay(index: number): Promise<void> {
+  const current = active;
+  if (!current || current.role !== 'host') return;
+  // Re-enumerate first: monitors get plugged and unplugged between sessions.
+  hostDisplays = await listDisplays(preset.fps);
+  if (!active || active !== current) return;
+  const next = hostDisplays[index];
+  if (!next) {
+    sendDisplayList();
+    return;
+  }
+  if (next.index === current.displayIndex) return;
+  current.displayIndex = next.index;
+  log('info', `已切换到${displayLabel(next)}（仅影响此屏）`);
+  if (!next.primary && panelHold) await releasePanel('（切换到非主屏）');
+  if (!active || active !== current) return;
+  aimInjector();
+  current.encoder?.stop();
+  startEncoder(current);
+  sendDisplayList();
+}
+
 function startEncoder(target: ActiveSession): void {
   // Frames queued for the previous encoder belong to a reference chain that the
   // new keyframe replaces; sending them only delays the useful picture.
@@ -489,10 +574,15 @@ function startEncoder(target: ActiveSession): void {
   // A fresh encoder already emits an IDR, so an IDR request arriving right after
   // the session starts must not tear it down again.
   lastKeyframeRestart = Date.now();
-  const { width, height, scaled } = negotiateSize(display, peerDisplay);
+  // Capture follows the display the controller picked (the primary until
+  // they say otherwise); geometry negotiation is against that panel, not
+  // the primary the process happened to start with.
+  const sel = target.role === 'host' ? (hostDisplays[target.displayIndex] ?? null) : null;
+  const capture = sel ?? display;
+  const { width, height, scaled } = negotiateSize(capture, peerDisplay);
   const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
-  let bitrateKbps = scaled ? scaleBitrate(presetKbps, display, { width, height }) : presetKbps;
+  let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
   // encoder produce faster than the path has proven it can carry. Without
   // this the encoder kept emitting the full preset rate into a saturated
@@ -501,7 +591,15 @@ function startEncoder(target: ActiveSession): void {
   if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
-    source: values.source === 'test' ? { kind: 'test', size: `${display.width}x${display.height}` } : { kind: 'screen', mode: 'auto' },
+    source:
+      values.source === 'test'
+        ? { kind: 'test', size: `${capture.width}x${capture.height}` }
+        : {
+            kind: 'screen',
+            mode: 'auto',
+            outputIndex: sel?.index,
+            rect: sel ? { x: sel.x, y: sel.y, width: sel.width, height: sel.height } : undefined,
+          },
     fps,
     bitrateKbps,
     targetSize: scaled ? { width, height } : undefined,
@@ -556,7 +654,10 @@ function startEncoder(target: ActiveSession): void {
   if (values.source !== 'test') {
     const mode = encoder.captureMode === 'dda' ? 'Desktop Duplication (GPU)' : 'GDI';
     const shape = scaled ? ` · 缩放输出 ${width}x${height} · ${bitrateKbps} kbps` : ` · ${bitrateKbps} kbps`;
-    log('info', `屏幕采集 ${mode} ${display.width}x${display.height}@${fps}${shape}`);
+    log(
+      'info',
+      `屏幕采集 ${mode} ${capture.width}x${capture.height}@${fps}${shape}${sel ? ` · ${displayLabel(sel)}` : ''}`,
+    );
   }
 }
 
@@ -914,8 +1015,20 @@ async function startSession(
   }
   // Hand the panel over before anything is captured, so the encoder, the injector
   // and the geometry advertised to the peer all see the final screen.
-  if (role === 'host' && state.handOverDisplay) {
-    await takeOverPanel(negotiateSize(display, peerDisplay));
+  if (role === 'host') {
+    hostDisplays = await listDisplays(preset.fps);
+    log(
+      'info',
+      hostDisplays.length > 1
+        ? `检测到 ${hostDisplays.length} 块屏幕：${hostDisplays.map(displayLabel).join(' · ')}，默认主屏`
+        : `单屏 ${displayLabel(hostDisplays[0]!)}`,
+    );
+    if (state.handOverDisplay) {
+      await takeOverPanel(negotiateSize(display, peerDisplay));
+      // The takeover may have changed the primary's mode; re-read the sizes
+      // so capture geometry and the screen picker describe reality.
+      hostDisplays = await listDisplays(preset.fps);
+    }
   }
   // The host resizes its output to the controller's viewport; the controller
   // reports its own screen so the host knows what to aim for.
@@ -955,6 +1068,14 @@ async function startSession(
       lastPeerAt = Date.now();
       if (ctl.t === 'bye') {
         endSession(ctl.reason ?? '对方已断开');
+        return;
+      }
+      if (ctl.t === 'displays' && role === 'controller') {
+        sendUi({ type: 'displays', displays: ctl.displays, active: ctl.active });
+        return;
+      }
+      if (ctl.t === 'select-display' && role === 'host') {
+        void switchDisplay(Math.round(ctl.index));
         return;
       }
       if (ctl.t === 'resize' && role === 'host' && active) {
@@ -1076,6 +1197,7 @@ async function startSession(
     sessionId: msg.sessionId,
     peerCandidates: values['force-relay'] ? [] : msg.peerCandidates,
     relayEndpoint: relay,
+    displayIndex: role === 'host' ? primaryDisplayIndex(hostDisplays) : 0,
   };
   wireRelayUpgrade(path);
   lastPeerAt = Date.now();
@@ -1088,6 +1210,8 @@ async function startSession(
     }
     startEncoder(active);
     injector.start();
+    aimInjector();
+    sendDisplayList();
   }
 
   sendUi({
@@ -1219,6 +1343,11 @@ function handleUi(msg: UiToApp): void {
       break;
     case 'keyframe':
       active?.session.requestKeyframe();
+      break;
+    case 'select-display':
+      if (active?.role === 'controller') {
+        active.session.sendControl({ t: 'select-display', index: Math.round(msg.index) });
+      }
       break;
     case 'client-display':
       if (msg.width > 0 && msg.height > 0) {
