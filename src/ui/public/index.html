@@ -266,6 +266,11 @@
           <code class="sas" id="sasCode">—</code>
         </div>
         <div class="session-actions">
+          <select id="viewMode" class="display-select" title="显示模式" aria-label="显示模式">
+            <option value="fit">适应屏幕</option>
+            <option value="hd">高清适应</option>
+            <option value="native">原始大小</option>
+          </select>
           <select id="displaySelect" class="display-select" hidden title="切换被控屏幕" aria-label="切换被控屏幕"></select>
           <button class="icon-btn" id="btnPointerLock" title="鼠标锁定（游戏相对模式）" aria-label="鼠标锁定">
             <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
@@ -284,6 +289,7 @@
 
       <div class="stage" id="stage" tabindex="0">
         <canvas id="screen"></canvas>
+        <textarea id="imeSink" rows="1" tabindex="-1" aria-hidden="true" autocomplete="off"></textarea>
         <div class="secure-banner" id="secureBanner" hidden>
           <strong>对方屏幕上是系统安全提示（UAC）或锁屏</strong>
           <span>这是 Windows 的安全隔离，远程画面与点击会被系统暂停。请让对方在本机点「是」，提示消失后将自动恢复。</span>

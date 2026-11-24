@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test tests/protocol.test.ts tests/transport.test.ts tests/media.test.ts tests/net.test.ts tests/code.test.ts tests/display.test.ts tests/relay.test.ts tests/relay-forward.test.ts tests/log.test.ts tests/signaling-client.test.ts",
+    "test": "node --import tsx --test tests/protocol.test.ts tests/transport.test.ts tests/media.test.ts tests/net.test.ts tests/code.test.ts tests/display.test.ts tests/relay.test.ts tests/relay-forward.test.ts tests/log.test.ts tests/host-input.test.ts tests/signaling-client.test.ts",
     "build:engine": "node scripts/build-engine.mjs",
     "desktop": "npm run build:engine && electron .",
     "dist": "npm run build:engine && electron-builder --win",

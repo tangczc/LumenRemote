@@ -27,6 +27,11 @@ const state = {
   configuredKey: '',
   decodedFrames: 0,
   page: 'assist',
+  /** Host displays as last reported (drives the 原始大小 modes). */
+  displays: [],
+  activeDisplay: 0,
+  /** fit | hd | native — how the stage shows and sizes the stream. */
+  viewMode: 'fit',
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -205,9 +210,32 @@ function send(msg) {
 let lastClientDisplay = '';
 let clientDisplayTimer = 0;
 
+/** The selected host display at its native size, when we know it. */
+function hostNativeSize() {
+  const list = state.displays ?? [];
+  const current = list.find((d) => d.index === state.activeDisplay) ?? list[0];
+  if (!current || current.width <= 0 || current.height <= 0) return null;
+  return { width: current.width, height: current.height };
+}
+
 function reportClientDisplay() {
   const stage = $('#stage');
   if (!stage) return;
+  // 高清适应 / 原始大小 ask the host for its native resolution instead of
+  // the stage size. A portrait panel squeezed into a landscape stage was
+  // encoded at the fitted size (half its pixels) and then upscaled by the
+  // browser — big and blurry. Native encode downscales in the browser,
+  // which stays sharp, at the cost of bandwidth.
+  const native = state.viewMode !== 'fit' ? hostNativeSize() : null;
+  if (native) {
+    const width = Math.round(native.width / 2) * 2;
+    const height = Math.round(native.height / 2) * 2;
+    const key = `${state.viewMode}:${width}x${height}`;
+    if (key === lastClientDisplay) return;
+    lastClientDisplay = key;
+    send({ type: 'client-display', width, height });
+    return;
+  }
   const rect = stage.getBoundingClientRect();
   if (rect.width < 160 || rect.height < 120) return; // not laid out yet
   // Report CSS pixels, not device pixels. Multiplying by devicePixelRatio made
@@ -220,7 +248,7 @@ function reportClientDisplay() {
   // keeps a one-pixel wobble from re-negotiating the stream.
   const width = Math.round(rect.width / 2) * 2;
   const height = Math.round(rect.height / 2) * 2;
-  const key = `${width}x${height}`;
+  const key = `fit:${width}x${height}`;
   if (key === lastClientDisplay) return;
   lastClientDisplay = key;
   send({ type: 'client-display', width, height });
@@ -265,7 +293,13 @@ function syncFullscreenChrome() {
   document.body.classList.toggle('is-fullscreen', fs);
   const btn = $('#btnFullscreen');
   if (btn) btn.title = fs ? '退出全屏（F11 / Esc）' : '全屏（F11）';
-  $('.session-top')?.classList.remove('peek');
+  const topBar = $('.session-top');
+  topBar?.classList.remove('peek');
+  if (!fs && topBar) {
+    topBar.classList.remove('placed');
+    topBar.style.left = '';
+    topBar.style.top = '';
+  }
   if (toolbarPeekTimer) {
     clearTimeout(toolbarPeekTimer);
     toolbarPeekTimer = 0;
@@ -571,7 +605,7 @@ function enterSession(msg) {
   delete $('#stage').dataset.video;
   if (msg.role === 'controller') {
     setupStageInput();
-    $('#stage').focus();
+    ($('#imeSink') ?? $('#stage'))?.focus();
     setTimeout(() => {
       if (state.decodedFrames === 0) send({ type: 'keyframe' });
     }, 700);
@@ -619,6 +653,9 @@ function leaveHostMode() {
  * mapping follows it, so the pointer can only ever land on that screen.
  */
 function renderDisplayPicker(displays, active) {
+  state.displays = displays;
+  state.activeDisplay = active;
+  scheduleClientDisplay();
   const select = $('#displaySelect');
   if (!select) return;
   if (state.session?.role === 'host') {
@@ -637,8 +674,18 @@ function renderDisplayPicker(displays, active) {
   select.hidden = displays.length <= 1;
 }
 
+function applyViewMode(mode) {
+  state.viewMode = mode;
+  const stage = $('#stage');
+  if (stage) stage.classList.toggle('view-native', mode === 'native');
+  const select = $('#viewMode');
+  if (select && select.value !== mode) select.value = mode;
+  scheduleClientDisplay();
+}
+
 function exitSession(reason) {
   state.session = null;
+  releaseRemoteKeys();
   const banner = $('#secureBanner');
   if (banner) banner.hidden = true;
   if (document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => {});
@@ -812,6 +859,8 @@ const KEYMAP = {
 let pendingMove = null;
 let pendingAbs = null;
 let inputReady = false;
+/** Releases every key held on the host; assigned by setupStageInput. */
+let releaseRemoteKeys = () => {};
 
 /**
  * Pointer motion is throttled to ~125 Hz by TIME, not by animation
@@ -913,7 +962,9 @@ function setupStageInput() {
   const wireButton = (b) => WIRE_BUTTON[b] ?? 0;
 
   canvas.addEventListener('mousedown', (ev) => {
-    stage.focus();
+    // Focus the IME sink so composition has somewhere to live; key events
+    // bubble up to the stage handlers either way.
+    ($('#imeSink') ?? stage).focus();
     // Position first, then the button. The button used to be sent immediately
     // while the absolute move waited for the next animation frame, so the
     // host clicked wherever its cursor already was instead of where the user
@@ -955,8 +1006,32 @@ function setupStageInput() {
     { passive: false },
   );
 
+  // Keys the host currently believes are down. If a keyup never arrives —
+  // the window loses focus mid-chord (Alt+Tab away and back is the
+  // classic), the user clicks a toolbar button while holding a key, the
+  // session drops — the host keeps the modifier down and every letter
+  // after that turns into a shortcut ("打字像在按快捷键"). Track presses
+  // and release them all whenever the chain of custody breaks.
+  const pressed = new Map();
+  const wireKey = (map) => ({ scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) });
+  function releaseAllKeys() {
+    for (const m of pressed.values()) {
+      send({ type: 'input', event: { k: 'ku', scan: m.scan, vk: m.vk } });
+    }
+    pressed.clear();
+  }
+  releaseRemoteKeys = releaseAllKeys;
+  window.addEventListener('blur', releaseAllKeys);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) releaseAllKeys();
+  });
+
   stage.addEventListener('keydown', (ev) => {
-    if (ev.isComposing) return;
+    // During IME composition (pinyin -> candidates) the physical keys
+    // belong to the IME, not the host; the committed text arrives via
+    // compositionend on the sink below. 'Process' is the same guard for
+    // IMEs that report isComposing late.
+    if (ev.isComposing || ev.key === 'Process') return;
     const map = KEYMAP[ev.code];
     if (!map) {
       // Layout-specific or IME-produced characters have no fixed scancode, so the
@@ -969,15 +1044,33 @@ function setupStageInput() {
     }
     ev.preventDefault();
     if (ev.repeat) return;
-    send({ type: 'input', event: { k: 'kd', scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) } });
+    const wired = wireKey(map);
+    pressed.set(ev.code, wired);
+    send({ type: 'input', event: { k: 'kd', scan: wired.scan, vk: wired.vk } });
   });
 
-  stage.addEventListener('keyup', (ev) => {
-    const map = KEYMAP[ev.code];
-    if (!map) return;
+  // Window-level, not stage-level: a key released after focus wandered
+  // (toolbar click, pointer-lock change) still has to reach the host.
+  window.addEventListener('keyup', (ev) => {
+    const wired = pressed.get(ev.code);
+    if (!wired) return;
+    pressed.delete(ev.code);
     ev.preventDefault();
-    send({ type: 'input', event: { k: 'ku', scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) } });
+    send({ type: 'input', event: { k: 'ku', scan: wired.scan, vk: wired.vk } });
   });
+
+  // IME commit path. Focus lives in the hidden sink during a session
+  // because browsers only compose into editable elements; without it,
+  // Chinese text typed on the controller evaporated — keydowns were
+  // swallowed as "composing" and the result went nowhere.
+  const imeSink = $('#imeSink');
+  if (imeSink) {
+    imeSink.addEventListener('compositionend', (ev) => {
+      const text = ev.data || imeSink.value;
+      imeSink.value = '';
+      if (text) send({ type: 'input', event: { k: 'kr', text } });
+    });
+  }
 
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === stage;
@@ -1019,6 +1112,38 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#viewMode')?.addEventListener('change', (ev) => {
+    applyViewMode(ev.target.value);
+    if (ev.target.value === 'hd') toast('高清适应：按对方原始分辨率传输（更清晰，更耗带宽）');
+    if (ev.target.value === 'native') toast('原始大小：1:1 显示，可滚动查看（按对方原始分辨率传输）');
+  });
+  // Drag the fullscreen toolbar by its empty areas (buttons and selects
+  // keep working normally). Once placed it stays where it was dropped
+  // until fullscreen exits.
+  const topBar = $('.session-top');
+  if (topBar) {
+    let drag = null;
+    topBar.addEventListener('pointerdown', (ev) => {
+      if (!document.fullscreenElement) return;
+      if (ev.target.closest('button, select, input, textarea, a')) return;
+      const rect = topBar.getBoundingClientRect();
+      drag = { dx: ev.clientX - rect.left, dy: ev.clientY - rect.top, width: rect.width, height: rect.height };
+      topBar.setPointerCapture?.(ev.pointerId);
+    });
+    topBar.addEventListener('pointermove', (ev) => {
+      if (!drag) return;
+      const x = Math.min(Math.max(0, ev.clientX - drag.dx), Math.max(0, window.innerWidth - drag.width));
+      const y = Math.min(Math.max(0, ev.clientY - drag.dy), Math.max(0, window.innerHeight - drag.height));
+      topBar.classList.add('placed');
+      topBar.style.left = `${x}px`;
+      topBar.style.top = `${y}px`;
+    });
+    const endDrag = () => {
+      drag = null;
+    };
+    topBar.addEventListener('pointerup', endDrag);
+    topBar.addEventListener('pointercancel', endDrag);
+  }
   $('#displaySelect')?.addEventListener('change', (ev) => {
     const index = Number(ev.target.value);
     if (Number.isFinite(index)) {
