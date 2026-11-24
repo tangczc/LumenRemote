@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '../src/media/nal.ts';
 import { annexBToAvcc, buildAvcC, codecString, extractParameterSets, streamConfigChanged } from '../src/media/avc.ts';
-import { capSizeForBitrate, negotiateSize, scaleBitrate } from '../src/media/target.ts';
+import { capSizeForBitrate, fitGeometryForBitrate, negotiateSize, scaleBitrate } from '../src/media/target.ts';
 import { buildEncoderArgs } from '../src/media/encoder.ts';
 
 /** Build a fake Annex-B stream: SPS, PPS, IDR slice(s), then P slices. */
@@ -195,6 +195,32 @@ describe('bitrate-driven size cap', () => {
   });
 });
 
+describe('starved-link geometry fitting', () => {
+  test('prefers 30 clear frames over 60 smeared ones when deeply starved', () => {
+    // 5.4 Mbps (a real measured uplink) into 2560x1440: at 60 fps the
+    // pixel budget is 0.9 Mpx (deep smear); at 30 fps it doubles to
+    // 1.8 Mpx, which keeps desktop text legible.
+    const fit = fitGeometryForBitrate({ width: 2560, height: 1440 }, 5_400, 60);
+    assert.equal(fit.fps, 30);
+    const pixels = fit.width * fit.height;
+    assert.ok(pixels <= 1_810_000 && pixels >= 1_700_000, `pixels=${pixels}`);
+  });
+
+  test('keeps 60 fps when the cut is shallow', () => {
+    const fit = fitGeometryForBitrate({ width: 1920, height: 1080 }, 8_000, 60);
+    assert.equal(fit.fps, 60);
+    assert.ok(fit.width < 1920);
+  });
+
+  test('changes nothing when the bitrate is ample', () => {
+    assert.deepEqual(fitGeometryForBitrate({ width: 3840, height: 2160 }, 56_000, 60), {
+      width: 3840,
+      height: 2160,
+      fps: 60,
+    });
+  });
+});
+
 describe('encode size negotiation', () => {
   const host = { width: 3840, height: 2160 };
 
@@ -259,6 +285,19 @@ describe('encode size negotiation', () => {
     assert.equal(args[args.indexOf('-bufsize') + 1], '600k');
     const args30 = buildEncoderArgs({ ...base, fps: 30, bitrateKbps: 8_000 });
     assert.equal(args30[args30.indexOf('-bufsize') + 1], '800k');
+  });
+
+  test('nvenc uses a quality preset with spatial AQ, not the fastest smear mode', () => {
+    // p1 at a constrained bitrate turns text into blocks; p4 spends the
+    // same bits far better and is still hardware-speed. Spatial AQ moves
+    // bits toward detail (glyphs) instead of flat backgrounds.
+    const args = buildEncoderArgs({
+      source: { kind: 'screen', mode: 'gdi' },
+      encoder: 'h264_nvenc',
+      onAccessUnit: () => {},
+    });
+    assert.equal(args[args.indexOf('-preset') + 1], 'p4');
+    assert.equal(args[args.indexOf('-spatial-aq') + 1], '1');
   });
 
   test('does not bake the host cursor into the video', () => {

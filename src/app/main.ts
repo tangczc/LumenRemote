@@ -19,7 +19,7 @@ import type { InputEvent } from '../protocol/messages.ts';
 import { splitAnnexB } from '../media/nal.ts';
 import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
-import { capSizeForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
+import { fitGeometryForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
 import {
@@ -653,7 +653,7 @@ function startEncoder(target: ActiveSession): void {
   const negotiated = negotiateSize(capture, peerDisplay);
   let { width, height } = negotiated;
   let scaled = negotiated.scaled;
-  const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
+  let fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
@@ -670,14 +670,15 @@ function startEncoder(target: ActiveSession): void {
   // Healthy paths never see this: it only engages once a measured
   // bitrate (or the relay cap) is in force.
   if (bitrateStarved || relayBudget) {
-    const capped = capSizeForBitrate({ width, height }, bitrateKbps, fps);
-    if (capped.width !== width || capped.height !== height) {
+    const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
+    if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
       log(
         'info',
-        `网络可用码率约 ${bitrateKbps} kbps，编码尺寸由 ${width}x${height} 降为 ${capped.width}x${capped.height} 以保证清晰度（带宽恢复后自动回升）`,
+        `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
       );
-      width = capped.width;
-      height = capped.height;
+      width = fit.width;
+      height = fit.height;
+      fps = fit.fps;
       scaled = true;
     }
   }
@@ -1264,7 +1265,7 @@ async function startSession(
         if (p && key !== presetKey) {
           presetKey = key;
           preset = p;
-          active.session.setMaxBitrate(p.netKbps * 1000);
+          active.session.setMaxBudget(qualityCeilingBps(p));
           log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
           if (key === 'uhd' && panelHold?.applied) {
             // The panel was taken over (switched down) at session start,
@@ -1323,26 +1324,48 @@ async function startSession(
       // Feed the congestion verdict back into the encoder (debounced, and
       // only on a material change): pacing alone cannot fix an encoder that
       // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
-      if (!active || active.role !== 'host' || !active.encoder) return;
+      // No encoder yet (path still probing) is not a reason to drop the
+      // verdict: record it, and startEncoder picks it up when it starts.
+      if (!active || active.role !== 'host') return;
       const now = Date.now();
-      if (now - lastBitrateAdaptAt < 8000) return;
       const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
-      const current = adaptedBitrateKbps > 0 ? adaptedBitrateKbps : preset.bitrateKbps;
+      // Judge the verdict against what the encoder can actually run at:
+      // the preset (or relay) cap. The wire verdict swings far above it
+      // on a probing link (4.6M -> 18.6M -> 4.6M ...), and comparing /
+      // storing it raw restarted the encoder at the *same* capped rate
+      // over and over — 16 no-op restarts in one 8-minute session, each
+      // costing a stall plus a keyframe burst into a thin uplink.
+      const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+      const capped = Math.min(kbps, capKbps);
+      const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
       // Wide hysteresis: restarting the encoder costs a pipeline stall
       // plus a keyframe burst, so on a healthy-but-variable link the cure
       // was worse than the disease — a visible freeze every few seconds.
       // Only a deep, sustained mismatch (40%+) justifies the restart;
       // the pacer absorbs anything smaller by dropping frames.
-      const drop = kbps < current * 0.6;
-      const recover = adaptedBitrateKbps > 0 && kbps > current * 1.5;
+      const drop = capped < current * 0.6;
+      const recover = adaptedBitrateKbps > 0 && capped > current * 1.5;
       if (!drop && !recover) return;
+      // Recoveries may land every 3 s: the old flat 8 s cadence meant a
+      // 4K stream spent its first half-minute climbing 2.4M -> 45M in
+      // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
+      // Drops keep the calm 8 s cadence — that direction is the one
+      // that thrashes on a variable link.
+      if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
       lastBitrateAdaptAt = now;
-      adaptedBitrateKbps = kbps;
+      // Recover in steps, not in one leap to the (probing) verdict: a
+      // 1.5x step that the link cannot hold is absorbed by the pacer
+      // inside the hysteresis band instead of crashing straight back
+      // down and restarting the encoder again.
+      adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
+      if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
       if (drop) bitrateStarved = true;
-      if (kbps >= preset.bitrateKbps * 0.6) bitrateStarved = false;
-      log('info', `按网络状况调整编码码率至 ${kbps} kbps`);
-      active.encoder.stop();
-      startEncoder(active);
+      if (capped >= capKbps * 0.6) bitrateStarved = false;
+      log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
+      if (active.encoder) {
+        active.encoder.stop();
+        startEncoder(active);
+      }
     },
   });
   session.start();
@@ -1471,6 +1494,12 @@ function isInputEvent(value: unknown): value is InputEvent {
   return k === 'mm' || k === 'ma' || k === 'mb' || k === 'mw' || k === 'kd' || k === 'ku' || k === 'kr';
 }
 
+
+/** Ceiling for a quality preset, honouring the relay budget when on it. */
+function qualityCeilingBps(p: (typeof QUALITY_PRESETS)[QualityPreset]): number {
+  return (relayBudget ? Math.min(p.netKbps, RELAY_NET_KBPS) : p.netKbps) * 1000;
+}
+
 function applyQuality(next: QualityPreset): void {
   const p = QUALITY_PRESETS[next];
   if (!p) return;
@@ -1478,7 +1507,7 @@ function applyQuality(next: QualityPreset): void {
   saveState(state);
   preset = p;
   presetKey = next;
-  active?.session.setMaxBitrate(p.netKbps * 1000);
+  if (active) active.session.setMaxBudget(qualityCeilingBps(p));
   if (active?.role === 'controller') {
     active.session.sendControl({ t: 'quality', preset: next });
   }
