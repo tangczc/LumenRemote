@@ -267,10 +267,13 @@
         </div>
         <div class="session-actions">
           <select id="displaySelect" class="display-select" hidden title="切换被控屏幕" aria-label="切换被控屏幕"></select>
+          <button class="icon-btn" id="btnPointerLock" title="鼠标锁定（游戏相对模式）" aria-label="鼠标锁定">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+          </button>
           <button class="icon-btn" id="btnKeyframe" title="请求关键帧" aria-label="请求关键帧">
             <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 12a8 8 0 11-2.3-5.6M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <button class="icon-btn" id="btnFullscreen" title="全屏" aria-label="全屏">
+          <button class="icon-btn" id="btnFullscreen" title="全屏（F11）" aria-label="全屏">
             <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
           </button>
           <button class="icon-btn danger" id="btnHangup" title="断开" aria-label="断开">
@@ -281,6 +284,10 @@
 
       <div class="stage" id="stage" tabindex="0">
         <canvas id="screen"></canvas>
+        <div class="secure-banner" id="secureBanner" hidden>
+          <strong>对方屏幕上是系统安全提示（UAC）或锁屏</strong>
+          <span>这是 Windows 的安全隔离，远程画面与点击会被系统暂停。请让对方在本机点「是」，提示消失后将自动恢复。</span>
+        </div>
         <div class="stage-overlay" id="stageOverlay">
           <div class="spinner" aria-hidden="true"></div>
           <p id="overlayText">正在建立安全连接…</p>
@@ -291,7 +298,7 @@
           <div class="hud-pill"><span class="hud-label">码率</span><span id="hudBitrate">—</span></div>
           <div class="hud-pill"><span class="hud-label">丢包</span><span id="hudLoss">—</span></div>
         </div>
-        <div class="hud-hint" id="captureHint">双击画面捕获键鼠（游戏用）</div>
+        <div class="hud-hint" id="captureHint">工具栏「鼠标锁定」可切换游戏相对模式</div>
       </div>
     </div>
 

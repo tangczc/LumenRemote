@@ -212,6 +212,8 @@ class Session(
 
     fun selectDisplay(index: Int) = sendControl(Messages.selectDisplay(index))
 
+    fun pointerLock(locked: Boolean) = sendControl(Messages.pointerLock(locked))
+
     /** Queue a bye immediately; the outgoing queue is thread-safe. */
     fun notifyBye(reason: String) = sendControl(Messages.bye(reason))
 

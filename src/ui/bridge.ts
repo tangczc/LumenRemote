@@ -57,6 +57,7 @@ export type UiToApp =
   | { type: 'fav-add'; code: string; name?: string }
   | { type: 'export-logs'; clientLog?: string }
   | { type: 'select-display'; index: number }
+  | { type: 'pointer-lock'; locked: boolean }
   | { type: 'fav-remove'; code: string };
 
 export interface AppSettingsDto {
@@ -114,6 +115,7 @@ export type AppToUi =
   | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string; ts: number }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'log-bundle'; filename: string; text: string }
+  | { type: 'secure-desktop'; active: boolean }
   | {
       type: 'displays';
       displays: { index: number; name: string; primary: boolean; width: number; height: number; refreshRate: number }[];

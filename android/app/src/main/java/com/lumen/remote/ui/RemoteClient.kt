@@ -32,6 +32,7 @@ class RemoteClient(
     private val onStats: (SessionStats) -> Unit,
     private val onSignalingFailed: (host: String) -> Unit = {},
     private val onDisplays: (List<DisplayOption>, Int) -> Unit = { _, _ -> },
+    private val onSecureDesktop: (Boolean) -> Unit = {},
 ) {
     private var signaling: SignalingClient? = null
     private var link: UdpLink? = null
@@ -231,6 +232,11 @@ class RemoteClient(
             onControl = { msg ->
                 when (msg.optString("t")) {
                     "idr" -> session?.requestKeyframe()
+                    "secure-desktop" -> {
+                        val activeNow = msg.optBoolean("active")
+                        log(if (activeNow) "对方屏幕被系统安全提示占用（UAC/锁屏），画面暂停" else "对方已确认系统提示，画面恢复")
+                        onSecureDesktop(activeNow)
+                    }
                     "displays" -> {
                         val arr = msg.optJSONArray("displays")
                         val list = ArrayList<DisplayOption>()
@@ -318,6 +324,10 @@ class RemoteClient(
 
     fun selectDisplay(index: Int) {
         session?.selectDisplay(index)
+    }
+
+    fun setPointerLock(locked: Boolean) {
+        session?.pointerLock(locked)
     }
 
     fun disconnect() {

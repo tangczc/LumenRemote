@@ -24,6 +24,14 @@ export interface ScreenSource {
    * addresses the output directly and ignores it.
    */
   rect?: { x: number; y: number; width: number; height: number };
+  /**
+   * Bake the host cursor into the video. Normally false: the controller
+   * renders its own local cursor with zero lag. It is switched on while
+   * the controller is in pointer-lock (relative mouse) mode, where the
+   * browser hides the local cursor entirely — without a baked cursor the
+   * user would have no visible pointer at all.
+   */
+  drawMouse?: boolean;
 }
 
 export interface EncoderOptions {
@@ -121,12 +129,14 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   // ddagrab hands the encoder D3D11 surfaces, which no scaler can consume, so a
   // resize has to round-trip through system memory. That costs one core at
   // 4K->1440p, which is why the native size is kept whenever it already fits.
-  // draw_mouse=0 on both capture paths: the cursor is NOT baked into the
-  // video. A baked-in cursor only moves when a frame arrives, so under any
-  // lag it trails the controller's real pointer, appears in whatever shape
-  // the host last used, and clicks seem to land "somewhere else". The
-  // controller renders its own local cursor instantly instead (see the
-  // stage canvas CSS), which is how commercial remote-desktop tools do it.
+  // draw_mouse defaults to 0 on both capture paths: the cursor is NOT
+  // baked into the video. A baked-in cursor only moves when a frame
+  // arrives, so under any lag it trails the controller's real pointer and
+  // clicks seem to land "somewhere else". The controller renders its own
+  // local cursor instantly instead (see the stage canvas CSS), which is
+  // how commercial remote-desktop tools do it. The one exception is
+  // pointer-lock mode: the browser hides the local cursor there, so the
+  // host bakes its own in (source.drawMouse) or the user has no pointer.
   // Only NVENC can consume D3D11 surfaces directly; every other encoder
   // (and any resize, which no scaler can do on GPU surfaces) round-trips
   // through system memory with hwdownload. That copy is still much
@@ -140,9 +150,11 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
     opts.source.kind === 'screen' && (opts.source.outputIndex ?? 0) > 0
       ? `output_idx=${opts.source.outputIndex}:`
       : '';
+  const drawMouse =
+    opts.source.kind === 'screen' && opts.source.drawMouse ? 1 : 0;
   const ddaChain = gpuDirect
-    ? `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=0`
-    : `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter ? `${scaleFilter},` : ''}format=nv12`;
+    ? `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=${drawMouse}`
+    : `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=${drawMouse},hwdownload,format=bgra,${scaleFilter ? `${scaleFilter},` : ''}format=nv12`;
 
   const input =
     opts.source.kind === 'screen'
@@ -155,7 +167,7 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
             '-framerate',
             String(fps),
             '-draw_mouse',
-            '0',
+            String(drawMouse),
             // One monitor out of the virtual desktop: gdigrab crops by
             // offset+size (offsets may be negative left of / above the
             // primary). Without a rect it grabs the whole desktop.
@@ -313,7 +325,13 @@ export class ScreenEncoder {
         const src = this.opts.source;
         (this.opts as { source: EncoderOptions['source'] }).source =
           src.kind === 'screen'
-            ? { kind: 'screen', mode: 'gdi', outputIndex: src.outputIndex, rect: src.rect }
+            ? {
+                kind: 'screen',
+                mode: 'gdi',
+                outputIndex: src.outputIndex,
+                rect: src.rect,
+                drawMouse: src.drawMouse,
+              }
             : src;
         this.start();
         return;

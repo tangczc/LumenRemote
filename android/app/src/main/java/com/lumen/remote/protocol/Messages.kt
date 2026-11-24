@@ -66,6 +66,9 @@ object Messages {
     fun selectDisplay(index: Int): ByteArray =
         JSONObject().put("t", "select-display").put("index", index).toString().toByteArray(Charsets.UTF_8)
 
+    fun pointerLock(locked: Boolean): ByteArray =
+        JSONObject().put("t", "pointer-lock").put("locked", locked).toString().toByteArray(Charsets.UTF_8)
+
     fun bye(reason: String = "closed"): ByteArray =
         JSONObject().put("t", "bye").put("reason", reason).toString().toByteArray(Charsets.UTF_8)
 

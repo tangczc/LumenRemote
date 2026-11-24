@@ -64,6 +64,19 @@ export type ControlMessage =
   | { t: 'displays'; displays: DisplayDescriptor[]; active: number }
   /** Controller -> host: capture and control this display instead. */
   | { t: 'select-display'; index: number }
+  /**
+   * Controller -> host: pointer-lock (relative mouse) engaged/released.
+   * While locked the browser hides the local cursor, so the host bakes
+   * its cursor into the video; without this the user has no pointer.
+   */
+  | { t: 'pointer-lock'; locked: boolean }
+  /**
+   * Host -> controller: the secure desktop (UAC prompt / lock screen) took
+   * over the host's screen. Video and input are suspended by Windows
+   * itself until a local user dismisses it; this exists so the controller
+   * shows *why* instead of a frozen black screen.
+   */
+  | { t: 'secure-desktop'; active: boolean }
   | { t: 'clipboard'; format: 'text' | 'html'; data: string }
   | { t: 'cursor'; visible: boolean; x: number; y: number }
   | { t: 'bye'; reason: string }

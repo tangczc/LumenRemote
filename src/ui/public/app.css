@@ -976,6 +976,12 @@ body {
   background: rgba(255, 255, 255, 0.1);
 }
 
+.icon-btn.active {
+  color: #fff;
+  background: rgba(94, 150, 255, 0.35);
+  border-color: rgba(94, 150, 255, 0.65);
+}
+
 .icon-btn.danger:hover {
   color: #fff;
   background: rgba(251, 113, 133, 0.25);
@@ -1011,12 +1017,53 @@ body {
   cursor: default;
 }
 
-/* True fullscreen: hide the session chrome so the stage IS the screen. */
+/* True fullscreen: hide the session chrome so the stage IS the screen.
+   The toolbar turns into a floating bar that peeks in when the pointer
+   touches the top edge — hangup, keyframe and the screen picker must stay
+   reachable without leaving fullscreen first. */
 .session:fullscreen {
   grid-template-rows: minmax(0, 1fr);
 }
 .session:fullscreen .session-top {
-  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: linear-gradient(180deg, rgba(5, 7, 11, 0.94), rgba(5, 7, 11, 0.78));
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  transform: translateY(-106%);
+  transition: transform 0.18s var(--ease);
+}
+.session:fullscreen .session-top.peek {
+  transform: none;
+}
+
+.secure-banner {
+  position: absolute;
+  left: 50%;
+  bottom: 56px;
+  transform: translateX(-50%);
+  z-index: 35;
+  display: grid;
+  gap: 4px;
+  max-width: min(560px, calc(100% - 32px));
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(251, 191, 36, 0.55);
+  background: rgba(46, 32, 4, 0.92);
+  color: #fde9c0;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  pointer-events: none;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+}
+
+.secure-banner strong {
+  color: #ffd97a;
+  font-size: 13.5px;
 }
 
 .stage-overlay {

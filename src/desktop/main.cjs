@@ -8,7 +8,7 @@
  * runtime. This process owns the window and lifecycle only.
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme, screen } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, shell, nativeTheme, screen } = require('electron');
 const { spawn } = require('node:child_process');
 const { existsSync, mkdirSync, copyFileSync } = require('node:fs');
 const { join } = require('node:path');
@@ -57,6 +57,13 @@ function waitForHttp(url, timeoutMs = 20000) {
     attempt();
   });
 }
+
+// No application menu: the default View menu binds F11 to *window*
+// fullscreen, which fights the page's session fullscreen (the toolbar
+// hiding and viewport reporting key off the element being fullscreen).
+// The page handles F11 itself; hiding the menu bar alone was not enough
+// because the accelerator still fired behind it.
+Menu.setApplicationMenu(null);
 
 function createWindow() {
   const win = new BrowserWindow({

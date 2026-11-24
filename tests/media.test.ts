@@ -228,6 +228,21 @@ describe('encode size negotiation', () => {
     assert.equal(buildEncoderArgs(base).includes('-offset_x'), false);
   });
 
+  test('bakes the cursor into the video only when asked (pointer-lock mode)', () => {
+    // Normally draw_mouse=0: the controller renders its own cursor. In
+    // pointer-lock mode the browser hides that cursor, so the host must
+    // bake its real one in or the pointer vanishes entirely.
+    const gdi = { kind: 'screen' as const, mode: 'gdi' as const };
+    const plain = buildEncoderArgs({ source: gdi, encoder: 'libx264', onAccessUnit: () => {} });
+    assert.equal(plain[plain.indexOf('-draw_mouse') + 1], '0');
+    const baked = buildEncoderArgs({
+      source: { ...gdi, drawMouse: true },
+      encoder: 'libx264',
+      onAccessUnit: () => {},
+    });
+    assert.equal(baked[baked.indexOf('-draw_mouse') + 1], '1');
+  });
+
   test('addresses a secondary display directly with ddagrab output_idx', () => {
     // Explicit `mode: 'dda'` skips the ffmpeg capability probe, so this runs
     // the same on every platform (the old fake `#!/bin/sh` binary was POSIX-only).
