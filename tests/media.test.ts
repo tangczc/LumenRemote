@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '../src/media/nal.ts';
 import { annexBToAvcc, buildAvcC, codecString, extractParameterSets, streamConfigChanged } from '../src/media/avc.ts';
-import { negotiateSize, scaleBitrate } from '../src/media/target.ts';
+import { capSizeForBitrate, negotiateSize, scaleBitrate } from '../src/media/target.ts';
 import { buildEncoderArgs } from '../src/media/encoder.ts';
 
 /** Build a fake Annex-B stream: SPS, PPS, IDR slice(s), then P slices. */
@@ -156,6 +156,42 @@ describe('avc configuration', () => {
     const out = annexBToAvcc(units);
     assert.equal(out.readUInt32BE(0), 4);
     assert.equal(out.readUInt32BE(4 + 4), 2);
+  });
+});
+
+describe('bitrate-driven size cap', () => {
+  test('leaves the size alone when the bitrate can describe it', () => {
+    assert.deepEqual(capSizeForBitrate({ width: 3840, height: 2160 }, 56_000, 60), {
+      width: 3840,
+      height: 2160,
+    });
+    assert.deepEqual(capSizeForBitrate({ width: 1920, height: 1080 }, 8_000, 30), {
+      width: 1920,
+      height: 1080,
+    });
+  });
+
+  test('shrinks a starved 1440p60 stream into its pixel budget, keeping aspect', () => {
+    // ~5 Mbps measured uplink vs 2560x1440@60 is ~0.02 bits/px: mosaic.
+    // The cap must land near 0.8 Mpx (roughly 1365x768), still 16:9, even dims.
+    const capped = capSizeForBitrate({ width: 2560, height: 1440 }, 5_000, 60);
+    const pixels = capped.width * capped.height;
+    assert.ok(pixels <= 840_000 && pixels >= 790_000, `pixels=${pixels}`);
+    assert.equal(capped.width % 2, 0);
+    assert.equal(capped.height % 2, 0);
+    assert.ok(Math.abs(capped.width / capped.height - 16 / 9) < 0.01);
+  });
+
+  test('keeps portrait geometry portrait', () => {
+    const capped = capSizeForBitrate({ width: 1080, height: 1920 }, 4_000, 60);
+    assert.ok(capped.height > capped.width);
+    assert.ok(capped.width * capped.height <= 670_000);
+  });
+
+  test('ignores nonsense inputs', () => {
+    const size = { width: 1920, height: 1080 };
+    assert.deepEqual(capSizeForBitrate(size, 0, 60), size);
+    assert.deepEqual(capSizeForBitrate(size, 5_000, 0), size);
   });
 });
 

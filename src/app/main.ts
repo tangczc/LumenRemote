@@ -19,7 +19,7 @@ import type { InputEvent } from '../protocol/messages.ts';
 import { splitAnnexB } from '../media/nal.ts';
 import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
-import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
+import { capSizeForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
 import {
@@ -324,6 +324,13 @@ let lastStatsLoggedAt = 0;
 let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
+/**
+ * True once the congestion controller has actually voted the link down
+ * this session. adaptedBitrateKbps alone cannot signal that: it is
+ * seeded with the slow-start value at every session start, so geometry
+ * keyed on it would shrink every healthy session's first seconds.
+ */
+let bitrateStarved = false;
 let lastBitrateAdaptAt = 0;
 /** Pending mid-session resize from the controller, debounced before the encoder restarts. */
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -641,7 +648,9 @@ function startEncoder(target: ActiveSession): void {
   // the primary the process happened to start with.
   const sel = target.role === 'host' ? (hostDisplays[target.displayIndex] ?? null) : null;
   const capture = sel ?? display;
-  const { width, height, scaled } = negotiateSize(capture, peerDisplay);
+  const negotiated = negotiateSize(capture, peerDisplay);
+  let { width, height } = negotiated;
+  let scaled = negotiated.scaled;
   const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
@@ -651,6 +660,25 @@ function startEncoder(target: ActiveSession): void {
   // pacer, which dropped frames, broke reference chains and forced an
   // encoder restart every second — the visible "卡得要死" death spiral.
   if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
+  // When the network (or the relay budget) has cut the bitrate far below
+  // what the negotiated pixels need, shrink the picture to fit the
+  // bitrate instead of starving every pixel into mosaic blocks. The
+  // smaller frame also serialises much faster on a thin uplink, which
+  // is where most of the input lag on a starved 4K stream comes from.
+  // Healthy paths never see this: it only engages once a measured
+  // bitrate (or the relay cap) is in force.
+  if (bitrateStarved || relayBudget) {
+    const capped = capSizeForBitrate({ width, height }, bitrateKbps, fps);
+    if (capped.width !== width || capped.height !== height) {
+      log(
+        'info',
+        `网络可用码率约 ${bitrateKbps} kbps，编码尺寸由 ${width}x${height} 降为 ${capped.width}x${capped.height} 以保证清晰度（带宽恢复后自动回升）`,
+      );
+      width = capped.width;
+      height = capped.height;
+      scaled = true;
+    }
+  }
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source:
@@ -1145,6 +1173,7 @@ async function startSession(
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
+  bitrateStarved = false;
   lastBitrateAdaptAt = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
@@ -1284,6 +1313,8 @@ async function startSession(
       if (!drop && !recover) return;
       lastBitrateAdaptAt = now;
       adaptedBitrateKbps = kbps;
+      if (drop) bitrateStarved = true;
+      if (kbps >= preset.bitrateKbps * 0.6) bitrateStarved = false;
       log('info', `按网络状况调整编码码率至 ${kbps} kbps`);
       active.encoder.stop();
       startEncoder(active);
