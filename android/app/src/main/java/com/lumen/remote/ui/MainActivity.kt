@@ -813,6 +813,17 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
     private fun stopInputModes() {
         if (mouseCaptured) setMouseCapture(false)
         if (keyboardShown) toggleSoftKeyboard()
+        // Never leave a modifier down on the host when a session ends
+        // mid-chord: the host's next letters would all become shortcuts.
+        // Same wire encoding as the desktop injector (extended = vk|0x100).
+        for ((scan, vk) in listOf(
+            0x1d to 0xa2, 0x11d to 0xa3, 0x38 to 0xa4, 0x138 to 0xa5,
+            0x2a to 0xa0, 0x36 to 0xa1, 0x15b to 0x5b, 0x15c to 0x5c,
+        )) {
+            client.sendInput(
+                Messages.inputKey(scan and 0xff, vk or (if (scan > 0xff) 0x100 else 0), false),
+            )
+        }
     }
 
     // --------------------------------------------------- hardware keyboard/mouse

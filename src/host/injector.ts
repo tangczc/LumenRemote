@@ -4,6 +4,29 @@ import { injectorScript } from '../util/resources.ts';
 
 const SCRIPT = injectorScript();
 
+/**
+ * [scan, vk] of every modifier, in the wire's encoding (scan truncated to
+ * its low byte by the caller, extended keys flagged in vk bit 0x100 — the
+ * same shape key events arrive in).
+ */
+const MODIFIER_KEYS: ReadonlyArray<readonly [number, number]> = [
+  [0x1d, 0xa2], // ControlLeft
+  [0x11d, 0xa3], // ControlRight
+  [0x38, 0xa4], // AltLeft
+  [0x138, 0xa5], // AltRight
+  [0x2a, 0xa0], // ShiftLeft
+  [0x36, 0xa1], // ShiftRight
+  [0x15b, 0x5b], // MetaLeft
+  [0x15c, 0x5c], // MetaRight
+];
+
+/** `ku` lines that leave no modifier down on the host. */
+export function modifierReleaseLines(): string[] {
+  return MODIFIER_KEYS.map(
+    ([scan, vk]) => `ku,${scan & 0xff},${vk | (scan > 0xff ? 0x100 : 0)}`,
+  );
+}
+
 export interface InjectorOptions {
   enabled?: boolean;
   log?: (level: 'info' | 'warn' | 'error', message: string) => void;
@@ -112,13 +135,24 @@ export class InputInjector {
 
   stop(): void {
     if (!this.proc) return;
+    const proc = this.proc;
+    this.proc = null;
     try {
-      this.proc.stdin?.end();
-      this.proc.kill();
+      // A session that ends mid-chord must not leave a modifier physically
+      // down on the host: the local user's next letters would all turn
+      // into shortcuts. Release first, then let the helper exit.
+      for (const line of modifierReleaseLines()) proc.stdin?.write(`${line}\n`);
+      proc.stdin?.end();
     } catch {
       /* ignore */
     }
-    this.proc = null;
+    setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        /* ignore */
+      }
+    }, 60).unref?.();
   }
 
   get droppedEvents(): number {

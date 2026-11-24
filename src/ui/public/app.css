@@ -997,6 +997,26 @@ body {
   outline: none;
 }
 
+/* Hidden IME capture field: an IME only composes into an editable
+   element, so keyboard focus lives here during a session and committed
+   text (e.g. Chinese candidates) is forwarded as unicode input. */
+#imeSink {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  width: 16px;
+  height: 16px;
+  opacity: 0;
+  pointer-events: none;
+  border: 0;
+  padding: 0;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: transparent;
+  outline: none;
+}
+
 .stage canvas {
   display: block;
   /* Fill the stage (in fullscreen: the whole screen). With `object-fit:

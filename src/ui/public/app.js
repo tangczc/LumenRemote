@@ -571,7 +571,7 @@ function enterSession(msg) {
   delete $('#stage').dataset.video;
   if (msg.role === 'controller') {
     setupStageInput();
-    $('#stage').focus();
+    ($('#imeSink') ?? $('#stage'))?.focus();
     setTimeout(() => {
       if (state.decodedFrames === 0) send({ type: 'keyframe' });
     }, 700);
@@ -639,6 +639,7 @@ function renderDisplayPicker(displays, active) {
 
 function exitSession(reason) {
   state.session = null;
+  releaseRemoteKeys();
   const banner = $('#secureBanner');
   if (banner) banner.hidden = true;
   if (document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => {});
@@ -812,6 +813,8 @@ const KEYMAP = {
 let pendingMove = null;
 let pendingAbs = null;
 let inputReady = false;
+/** Releases every key held on the host; assigned by setupStageInput. */
+let releaseRemoteKeys = () => {};
 
 /**
  * Pointer motion is throttled to ~125 Hz by TIME, not by animation
@@ -913,7 +916,9 @@ function setupStageInput() {
   const wireButton = (b) => WIRE_BUTTON[b] ?? 0;
 
   canvas.addEventListener('mousedown', (ev) => {
-    stage.focus();
+    // Focus the IME sink so composition has somewhere to live; key events
+    // bubble up to the stage handlers either way.
+    ($('#imeSink') ?? stage).focus();
     // Position first, then the button. The button used to be sent immediately
     // while the absolute move waited for the next animation frame, so the
     // host clicked wherever its cursor already was instead of where the user
@@ -955,8 +960,32 @@ function setupStageInput() {
     { passive: false },
   );
 
+  // Keys the host currently believes are down. If a keyup never arrives —
+  // the window loses focus mid-chord (Alt+Tab away and back is the
+  // classic), the user clicks a toolbar button while holding a key, the
+  // session drops — the host keeps the modifier down and every letter
+  // after that turns into a shortcut ("打字像在按快捷键"). Track presses
+  // and release them all whenever the chain of custody breaks.
+  const pressed = new Map();
+  const wireKey = (map) => ({ scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) });
+  function releaseAllKeys() {
+    for (const m of pressed.values()) {
+      send({ type: 'input', event: { k: 'ku', scan: m.scan, vk: m.vk } });
+    }
+    pressed.clear();
+  }
+  releaseRemoteKeys = releaseAllKeys;
+  window.addEventListener('blur', releaseAllKeys);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) releaseAllKeys();
+  });
+
   stage.addEventListener('keydown', (ev) => {
-    if (ev.isComposing) return;
+    // During IME composition (pinyin -> candidates) the physical keys
+    // belong to the IME, not the host; the committed text arrives via
+    // compositionend on the sink below. 'Process' is the same guard for
+    // IMEs that report isComposing late.
+    if (ev.isComposing || ev.key === 'Process') return;
     const map = KEYMAP[ev.code];
     if (!map) {
       // Layout-specific or IME-produced characters have no fixed scancode, so the
@@ -969,15 +998,33 @@ function setupStageInput() {
     }
     ev.preventDefault();
     if (ev.repeat) return;
-    send({ type: 'input', event: { k: 'kd', scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) } });
+    const wired = wireKey(map);
+    pressed.set(ev.code, wired);
+    send({ type: 'input', event: { k: 'kd', scan: wired.scan, vk: wired.vk } });
   });
 
-  stage.addEventListener('keyup', (ev) => {
-    const map = KEYMAP[ev.code];
-    if (!map) return;
+  // Window-level, not stage-level: a key released after focus wandered
+  // (toolbar click, pointer-lock change) still has to reach the host.
+  window.addEventListener('keyup', (ev) => {
+    const wired = pressed.get(ev.code);
+    if (!wired) return;
+    pressed.delete(ev.code);
     ev.preventDefault();
-    send({ type: 'input', event: { k: 'ku', scan: map[0] & 0xff, vk: map[1] | (map[0] > 0xff ? 0x100 : 0) } });
+    send({ type: 'input', event: { k: 'ku', scan: wired.scan, vk: wired.vk } });
   });
+
+  // IME commit path. Focus lives in the hidden sink during a session
+  // because browsers only compose into editable elements; without it,
+  // Chinese text typed on the controller evaporated — keydowns were
+  // swallowed as "composing" and the result went nowhere.
+  const imeSink = $('#imeSink');
+  if (imeSink) {
+    imeSink.addEventListener('compositionend', (ev) => {
+      const text = ev.data || imeSink.value;
+      imeSink.value = '';
+      if (text) send({ type: 'input', event: { k: 'kr', text } });
+    });
+  }
 
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === stage;
