@@ -63,6 +63,9 @@ object Messages {
 
     fun idr(): ByteArray = JSONObject().put("t", "idr").toString().toByteArray(Charsets.UTF_8)
 
+    fun selectDisplay(index: Int): ByteArray =
+        JSONObject().put("t", "select-display").put("index", index).toString().toByteArray(Charsets.UTF_8)
+
     fun bye(reason: String = "closed"): ByteArray =
         JSONObject().put("t", "bye").put("reason", reason).toString().toByteArray(Charsets.UTF_8)
 

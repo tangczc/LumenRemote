@@ -210,6 +210,8 @@ class Session(
 
     fun requestKeyframe() = sendControl(Messages.idr())
 
+    fun selectDisplay(index: Int) = sendControl(Messages.selectDisplay(index))
+
     /** Queue a bye immediately; the outgoing queue is thread-safe. */
     fun notifyBye(reason: String) = sendControl(Messages.bye(reason))
 

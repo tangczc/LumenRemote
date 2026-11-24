@@ -55,6 +55,8 @@ export type UiToApp =
   | { type: 'set-verify'; mode: VerifyMode; password?: string }
   | { type: 'set-signal'; host: string; port: number }
   | { type: 'fav-add'; code: string; name?: string }
+  | { type: 'export-logs'; clientLog?: string }
+  | { type: 'select-display'; index: number }
   | { type: 'fav-remove'; code: string };
 
 export interface AppSettingsDto {
@@ -110,7 +112,13 @@ export type AppToUi =
   | { type: 'session-route'; route: 'p2p' | 'relay' }
   | { type: 'session-end'; reason: string }
   | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string; ts: number }
-  | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string };
+  | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
+  | { type: 'log-bundle'; filename: string; text: string }
+  | {
+      type: 'displays';
+      displays: { index: number; name: string; primary: boolean; width: number; height: number; refreshRate: number }[];
+      active: number;
+    };
 
 export interface SessionStatsDto {
   fps: number;

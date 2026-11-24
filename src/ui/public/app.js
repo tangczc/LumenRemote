@@ -53,7 +53,27 @@ function fmtMs(ms) {
   return `${ms.toFixed(ms < 10 ? 1 : 0)} ms`;
 }
 
+/* Browser-side log lines, retained for the 导出日志 bundle: the engine log
+ * alone cannot show decoder errors or WebCodecs complaints. */
+const clientLogLines = [];
+function rememberLog(level, message) {
+  const stamp = new Date().toISOString();
+  clientLogLines.push(`${stamp} [${level}] ${message}`);
+  if (clientLogLines.length > 1000) clientLogLines.shift();
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 function logLine(level, message) {
+  rememberLog(level, message);
   const host = $('#logList');
   if (!host) return;
   const row = document.createElement('div');
@@ -280,6 +300,10 @@ function handleServer(msg) {
       configureDecoder(msg);
       break;
 
+    case 'displays':
+      renderDisplayPicker(msg.displays ?? [], msg.active ?? 0);
+      break;
+
     case 'stats':
       state.stats = msg.stats;
       renderStats(msg.stats);
@@ -291,6 +315,11 @@ function handleServer(msg) {
 
     case 'log':
       logLine(msg.level, msg.message);
+      break;
+
+    case 'log-bundle':
+      downloadText(msg.filename || 'lumen-logs.txt', msg.text || '');
+      toast('日志已下载，把这个文件发给开发者即可');
       break;
 
     case 'notice':
@@ -516,8 +545,38 @@ function leaveHostMode() {
   window.lumen?.setHostPanel?.('off');
 }
 
+/**
+ * The host's screens, as reported over the control channel. Only shown
+ * when there is an actual choice: a single-screen host gets no extra UI.
+ * Switching restarts the host's encoder on the picked display; the input
+ * mapping follows it, so the pointer can only ever land on that screen.
+ */
+function renderDisplayPicker(displays, active) {
+  const select = $('#displaySelect');
+  if (!select) return;
+  if (state.session?.role === 'host') {
+    const current = displays.find((d) => d.index === active);
+    if (current) logLine('info', `对方正在查看：屏幕 ${current.index + 1}${current.primary ? '（主屏）' : ''}`);
+    return;
+  }
+  select.replaceChildren();
+  for (const d of displays) {
+    const option = document.createElement('option');
+    option.value = String(d.index);
+    option.textContent = `屏幕 ${d.index + 1}${d.primary ? '（主屏）' : ''} · ${d.width}×${d.height}`;
+    select.appendChild(option);
+  }
+  select.value = String(active);
+  select.hidden = displays.length <= 1;
+}
+
 function exitSession(reason) {
   state.session = null;
+  const select = $('#displaySelect');
+  if (select) {
+    select.hidden = true;
+    select.replaceChildren();
+  }
   state.sessionId = null;
   $('#sessionLayer').hidden = true;
   $('#requestModal').hidden = true;
@@ -889,6 +948,27 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#displaySelect')?.addEventListener('change', (ev) => {
+    const index = Number(ev.target.value);
+    if (Number.isFinite(index)) {
+      send({ type: 'select-display', index });
+      toast(`正在切换到屏幕 ${index + 1}…`);
+    }
+  });
+  $('#btnExportLogs')?.addEventListener('click', () => {
+    const header = [
+      `浏览器 ${navigator.userAgent}`,
+      `页面 ${location.href} · 时间 ${new Date().toISOString()}`,
+      `解码器 ${state.decoderState ?? '(未建立)'}`,
+    ].join('\n');
+    const clientLog = `${header}\n${clientLogLines.join('\n')}`;
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      send({ type: 'export-logs', clientLog });
+    } else {
+      // Engine unreachable: still hand the user the browser half.
+      downloadText(`lumen-ui-logs-${Date.now()}.txt`, clientLog);
+    }
+  });
   for (const btn of $$('.nav-item')) {
     btn.addEventListener('click', () => showPage(btn.dataset.page));
   }

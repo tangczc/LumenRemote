@@ -262,6 +262,13 @@ export class Session {
   close(reason = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    this.log('info', `会话关闭: ${reason}`, {
+      role: this.role,
+      session: this.sessionId.slice(0, 8),
+      packetsSent: this.txPackets,
+      packetsReceived: this.rxPackets,
+      authFailures: this.authFailures,
+    });
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
     this.pacer.stop();
@@ -459,6 +466,12 @@ export class Session {
     const payload = this.keys.rx.open(header.seq, aad, packet.subarray(HEADER_LEN));
     if (!payload) {
       this.authFailures++;
+      // A trickle of failures is line noise or a stale peer; a flood is an
+      // attack or a key mismatch. Either way the first and every 100th are
+      // worth a line — logging all of them would let a spoofer fill the disk.
+      if (this.authFailures === 1 || this.authFailures % 100 === 0) {
+        this.log('warn', `数据包鉴权失败（累计 ${this.authFailures}）`);
+      }
       return;
     }
     // Path migration: only a packet that passed AEAD can move the send

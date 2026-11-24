@@ -4,6 +4,9 @@ import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '..
 import { annexBToAvcc, buildAvcC, codecString, extractParameterSets } from '../src/media/avc.ts';
 import { negotiateSize, scaleBitrate } from '../src/media/target.ts';
 import { buildEncoderArgs } from '../src/media/encoder.ts';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 /** Build a fake Annex-B stream: SPS, PPS, IDR slice(s), then P slices. */
 function nal(type: number, body: number[]): Buffer {
@@ -210,6 +213,42 @@ describe('encode size negotiation', () => {
     const base = { source: { kind: 'screen' as const, mode: 'gdi' as const }, encoder: 'libx264' as const, onAccessUnit: () => {} };
     const args = buildEncoderArgs(base);
     assert.equal(args[args.indexOf('-draw_mouse') + 1], '0');
+  });
+
+  test('crops one monitor out of the virtual desktop with gdigrab', () => {
+    // GDI addresses the desktop as a whole, so a secondary screen is a
+    // region of it — offsets may be negative (panel left of the primary).
+    const base = { source: { kind: 'screen' as const, mode: 'gdi' as const }, encoder: 'libx264' as const, onAccessUnit: () => {} };
+    const args = buildEncoderArgs({
+      ...base,
+      source: { kind: 'screen', mode: 'gdi', outputIndex: 2, rect: { x: -1080, y: 120, width: 1080, height: 1920 } },
+    });
+    assert.equal(args[args.indexOf('-offset_x') + 1], '-1080');
+    assert.equal(args[args.indexOf('-offset_y') + 1], '120');
+    assert.equal(args[args.indexOf('-video_size') + 1], '1080x1920');
+    assert.ok(args.indexOf('-offset_x') < args.indexOf('desktop'));
+    // No rect, no crop: the single-screen invocation is unchanged.
+    assert.equal(buildEncoderArgs(base).includes('-offset_x'), false);
+  });
+
+  test('addresses a secondary display directly with ddagrab output_idx', () => {
+    // A fake ffmpeg that advertises ddagrab keeps this off the real binary.
+    const dir = mkdtempSync(join(tmpdir(), 'lumen-fake-ffmpeg-'));
+    const fake = join(dir, 'ffmpeg');
+    writeFileSync(
+      fake,
+      '#!/bin/sh\ncase "$*" in *-filters*) echo " ddagrab ";; *-encoders*) echo " libx264 h264_nvenc ";; esac\n',
+      { mode: 0o755 },
+    );
+    const args = buildEncoderArgs({
+      source: { kind: 'screen', mode: 'auto', outputIndex: 1, rect: { x: 1920, y: 0, width: 2560, height: 1440 } },
+      encoder: 'h264_nvenc',
+      ffmpegPath: fake,
+      onAccessUnit: () => {},
+    });
+    const chain = args.find((a) => a.includes('ddagrab'));
+    assert.ok(chain?.startsWith('ddagrab=output_idx=1:'), chain);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test('only adds a scale stage when the frame is actually resized', () => {

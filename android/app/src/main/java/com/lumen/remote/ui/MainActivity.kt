@@ -121,6 +121,9 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
     private var wheelAccum = 0f
 
     private lateinit var captureButton: android.widget.Button
+    private lateinit var displayButton: android.widget.Button
+    private var hostDisplays: List<DisplayOption> = emptyList()
+    private var activeDisplay = 0
     private lateinit var keyboardButton: android.widget.Button
     private lateinit var imeField: EditText
     private var mouseCaptured = false
@@ -129,6 +132,11 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.lumen.remote.util.LLog.init(this)
+        com.lumen.remote.util.LLog.i(
+            "应用",
+            "=== Lumen Remote 启动 · ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT}) ===",
+        )
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         root = FrameLayout(this)
         homeView = buildHome()
@@ -148,6 +156,8 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
                 runOnUiThread {
                     hideWaiting()
                     sessionStatsText.text = "SAS $sas"
+                    hostDisplays = emptyList()
+                    if (::displayButton.isInitialized) displayButton.visibility = View.GONE
                     showSession(true)
                 }
             },
@@ -164,6 +174,7 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
                     connectButton.isEnabled = true
                 }
             },
+            onDisplays = { list, active -> runOnUiThread { updateDisplayButton(list, active) } },
             onFrame = { frame -> handleFrame(frame) },
             onStats = { stats -> runOnUiThread { renderStats(stats) } },
             onSignalingFailed = { failedHost ->
@@ -230,10 +241,43 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
             android.os.Build.HARDWARE.contains("ranchu", ignoreCase = true)
 
     private fun appendLog(line: String) {
-        android.util.Log.i("LumenRemote", line)
+        com.lumen.remote.util.LLog.i("界面", line)
         val existing = logText.text?.toString().orEmpty()
         val merged = if (existing.isEmpty()) line else "$existing\n$line"
-        logText.text = merged.takeLast(600)
+        logText.text = merged.takeLast(20000)
+    }
+
+    /**
+     * The host's screen picker: cycles through its displays. Hidden while
+     * the host has a single screen — there is nothing to choose. Input on
+     * the host is mapped into the selected display only, so picking a
+     * screen can never move the pointer (or a click) onto another one.
+     */
+    private fun updateDisplayButton(list: List<DisplayOption>, active: Int) {
+        hostDisplays = list
+        activeDisplay = active
+        if (list.size <= 1) {
+            displayButton.visibility = View.GONE
+            return
+        }
+        val current = list.firstOrNull { it.index == active }
+        displayButton.text = "屏幕 ${active + 1}${if (current?.primary == true) "（主屏）" else ""}"
+        displayButton.visibility = View.VISIBLE
+    }
+
+    /** One-tap diagnosis bundle: hand the log file to any share target. */
+    private fun exportLogs() {
+        val header = listOf(
+            "Lumen Remote 日志导出（Android）",
+            "生成时间 ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}",
+            "设备 ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})",
+        ).joinToString("\n")
+        val share = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "Lumen Remote 日志")
+            putExtra(android.content.Intent.EXTRA_TEXT, com.lumen.remote.util.LLog.exportText(header))
+        }
+        startActivity(android.content.Intent.createChooser(share, "导出日志"))
     }
 
     // ------------------------------------------------------------------- home
@@ -336,6 +380,11 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
         right.addView(spacer(this, 16f))
         logText = body("", Theme.TEXT_DIM, 10.5f)
         right.addView(logText)
+
+        right.addView(spacer(this, 10f))
+        val exportButton = ghostButton("导出日志")
+        exportButton.setOnClickListener { exportLogs() }
+        right.addView(exportButton)
 
         applyHomeLayout()
 
@@ -591,6 +640,17 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
             connectButton.isEnabled = true
             statusText.text = "已断开连接"
         }
+        displayButton = ghostButton("屏幕")
+        displayButton.visibility = View.GONE
+        displayButton.setOnClickListener {
+            if (hostDisplays.size > 1) {
+                val next = (activeDisplay + 1) % hostDisplays.size
+                client.selectDisplay(next)
+                displayButton.text = "屏幕 ${next + 1}…"
+            }
+        }
+        bottomBar.addView(displayButton)
+        bottomBar.addView(spacerH(8f))
         bottomBar.addView(rightClickButton)
         bottomBar.addView(spacerH(8f))
         bottomBar.addView(keyboardButton)
@@ -603,7 +663,7 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
         // Touch-only controls must never take focus: a focused Button swallows the
         // Enter key as a click, so pressing Enter to send a line to the host used to
         // "press" whichever button happened to hold focus -- 挂断 included.
-        for (button in listOf(rightClickButton, keyboardButton, captureButton, keyframeButton, hangupButton)) {
+        for (button in listOf(rightClickButton, keyboardButton, captureButton, keyframeButton, hangupButton, displayButton)) {
             button.isFocusable = false
             button.isFocusableInTouchMode = false
         }

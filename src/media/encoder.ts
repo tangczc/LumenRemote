@@ -12,6 +12,18 @@ export interface ScreenSource {
    * kept as a fallback for machines where ddagrab is unavailable.
    */
   mode?: 'dda' | 'gdi' | 'auto';
+  /**
+   * Which attached display to capture, as an enumeration index (the same
+   * order the host reports to the controller). Omit or 0 = primary output:
+   * the ddagrab invocation stays byte-identical to the single-screen path.
+   */
+  outputIndex?: number;
+  /**
+   * The display's rectangle in virtual-desktop coordinates. The gdigrab
+   * path needs it to crop one monitor out of the virtual desktop; ddagrab
+   * addresses the output directly and ignores it.
+   */
+  rect?: { x: number; y: number; width: number; height: number };
 }
 
 export interface EncoderOptions {
@@ -116,9 +128,17 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   // through system memory with hwdownload. That copy is still much
   // cheaper than a GDI capture of the same desktop.
   const gpuDirect = encoder === 'h264_nvenc' && !scaleFilter;
+  // Multi-monitor: ddagrab addresses the DXGI output directly (output_idx
+  // follows the same enumeration order as the display list the host reports),
+  // so a secondary screen costs no extra copy. Only set it past the primary
+  // to keep the single-screen invocation unchanged.
+  const outputIdx =
+    opts.source.kind === 'screen' && (opts.source.outputIndex ?? 0) > 0
+      ? `output_idx=${opts.source.outputIndex}:`
+      : '';
   const ddaChain = gpuDirect
-    ? `ddagrab=framerate=${fps}:draw_mouse=0`
-    : `ddagrab=framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter ? `${scaleFilter},` : ''}format=nv12`;
+    ? `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=0`
+    : `ddagrab=${outputIdx}framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter ? `${scaleFilter},` : ''}format=nv12`;
 
   const input =
     opts.source.kind === 'screen'
@@ -132,6 +152,19 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
             String(fps),
             '-draw_mouse',
             '0',
+            // One monitor out of the virtual desktop: gdigrab crops by
+            // offset+size (offsets may be negative left of / above the
+            // primary). Without a rect it grabs the whole desktop.
+            ...(opts.source.kind === 'screen' && opts.source.rect
+              ? [
+                  '-offset_x',
+                  String(Math.round(opts.source.rect.x)),
+                  '-offset_y',
+                  String(Math.round(opts.source.rect.y)),
+                  '-video_size',
+                  `${Math.round(opts.source.rect.width)}x${Math.round(opts.source.rect.height)}`,
+                ]
+              : []),
             '-i',
             'desktop',
             ...(scaleFilter ? ['-vf', scaleFilter] : []),
@@ -273,7 +306,11 @@ export class ScreenEncoder {
         this.restarted = true;
         this.currentMode = 'gdi';
         this.opts.onLog?.('ddagrab 中断，回退到 gdigrab');
-        (this.opts as { source: EncoderOptions['source'] }).source = { kind: 'screen', mode: 'gdi' };
+        const src = this.opts.source;
+        (this.opts as { source: EncoderOptions['source'] }).source =
+          src.kind === 'screen'
+            ? { kind: 'screen', mode: 'gdi', outputIndex: src.outputIndex, rect: src.rect }
+            : src;
         this.start();
         return;
       }

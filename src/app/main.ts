@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { platform, hostname } from 'node:os';
+import { platform, hostname, arch } from 'node:os';
 import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -21,7 +21,13 @@ import { annexBToAvcc, describeStream, type AvcStreamConfig } from '../media/avc
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
 import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
-import { queryDisplay } from '../host/display.ts';
+import {
+  listDisplays,
+  primaryDisplayIndex,
+  queryDisplay,
+  virtualBounds,
+  type HostDisplay,
+} from '../host/display.ts';
 import {
   handOverDisplay as takeOverDisplay,
   pickDisplayMode,
@@ -33,6 +39,7 @@ import {
 import { startUiServer, type UiServer } from '../ui/server.ts';
 import { openUi } from '../ui/open.ts';
 import { ffmpegAvailable, ffmpegBinary } from '../util/resources.ts';
+import { AppLogger, installCrashHandlers, parseLogLevel } from '../util/log.ts';
 import {
   NET_OVERHEAD,
   QUALITY_PRESETS,
@@ -44,6 +51,7 @@ import {
   type VerifyMode,
 } from '../ui/bridge.ts';
 import type { Candidate, ServerToClient } from '../signaling/protocol.ts';
+import type { DisplayDescriptor } from '../protocol/messages.ts';
 
 /**
  * Unified remote-control client.
@@ -98,6 +106,8 @@ const { values } = parseArgs({
     'no-upnp': { type: 'boolean', default: false },
     'no-candidates': { type: 'boolean', default: false },
     'force-relay': { type: 'boolean', default: false },
+    'log-level': { type: 'string', default: '' },
+    'log-dir': { type: 'string', default: '' },
     help: { type: 'boolean', default: false },
   },
 });
@@ -120,6 +130,8 @@ Lumen Remote — unified remote-control client
   --no-upnp           skip router port mapping (NAT-PMP / UPnP)
   --no-candidates     advertise no P2P candidates; forces the relay (debug)
   --force-relay       ignore the peer's candidates and use the relay (debug)
+  --log-level <lvl>   debug|info|warn|error (default info; env RD_LOG_LEVEL)
+  --log-dir <path>    log directory (default <state>/logs; env RD_LOG_DIR)
 `);
   process.exit(0);
 }
@@ -127,6 +139,24 @@ Lumen Remote — unified remote-control client
 const DEVICE_NAME = values.name || hostname();
 const STATE_DIR = process.env.RD_STATE_DIR || join(process.cwd(), '.rd-state');
 const STATE_FILE = join(STATE_DIR, 'app-state.json');
+
+// Full-fidelity logging: structured lines to <state>/logs/lumen.log (5 MB x 5
+// rotation) plus the console and UI mirrors below. When something goes wrong
+// the user exports this from the UI log card and sends the file over as-is.
+const LOG_DIR = values['log-dir'] || process.env.RD_LOG_DIR || join(STATE_DIR, 'logs');
+const logger = new AppLogger({
+  dir: LOG_DIR,
+  name: 'lumen',
+  level: parseLogLevel(values['log-level'] || process.env.RD_LOG_LEVEL),
+  consoleEcho: true,
+});
+installCrashHandlers(logger);
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    logger.warn('app', `收到 ${signal}，进程退出`);
+    process.exit(0);
+  });
+}
 
 interface AppState {
   deviceId: string;
@@ -226,8 +256,7 @@ const sendUi = (msg: AppToUi): void => {
 };
 
 const log = (level: 'info' | 'warn' | 'error', message: string): void => {
-  const stamp = new Date().toISOString().slice(11, 23);
-  console.log(`${stamp} [${level}] ${message}`);
+  logger.log(level, 'app', message);
   sendUi({ type: 'log', level, message, ts: Date.now() });
 };
 
@@ -236,6 +265,8 @@ const log = (level: 'info' | 'warn' | 'error', message: string): void => {
 // Reassigned while a host session owns the panel: the capture size follows the
 // resolution the controller asked for instead of the one the user normally runs.
 let display = await queryDisplay(preset.fps);
+/** Every display attached to this host; refreshed when a host session starts. */
+let hostDisplays: HostDisplay[] = await listDisplays(preset.fps);
 /** Panel state a host session took over, so ending it can put everything back. */
 interface PanelHold {
   layout: DisplayLayout[];
@@ -262,6 +293,8 @@ interface ActiveSession {
   relayEndpoint: { address: string; port: number };
   /** Cancels a background relay->P2P upgrade loop belonging to this session. */
   cancelUpgrade?: () => void;
+  /** Which host display is captured/controlled (host role; index into hostDisplays). */
+  displayIndex: number;
 }
 
 let active: ActiveSession | null = null;
@@ -284,6 +317,9 @@ let controllerSize = { width: display.width, height: display.height };
 let pendingEph: EphemeralKeyPair | null = null;
 let pendingRole: 'host' | 'controller' = 'host';
 let lastKeyframeRestart = 0;
+/** Last stats snapshot written to the log file, and when (10 s cadence). */
+let lastStatsLoggedAt = 0;
+let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
 let lastBitrateAdaptAt = 0;
@@ -298,6 +334,19 @@ let relayBudget = false;
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
 const decodeInUi = values.display === 'ui';
+
+logger.info(
+  'app',
+  `=== Lumen Remote ${VERSION} 启动 · ${platform()} ${arch()} · Node ${process.version} · pid ${process.pid} ===`,
+);
+logger.info(
+  'app',
+  `日志文件 ${logger.filePath} · 级别 ${logger.currentLevel} · 状态目录 ${STATE_DIR}`,
+);
+logger.info(
+  'app',
+  `参数 signal=${state.signalHost}:${state.signalPort} ui=${values.ui} source=${values.source} quality=${state.quality} encoder=${values.encoder} inject=${values.inject} upnp=${!values['no-upnp']} 验证码${values.password ? "(命令行已设置)" : "(未设置)"}`,
+);
 
 const link = await UdpLink.bind({});
 link.setLatch(true);
@@ -444,6 +493,80 @@ async function dialledIpAddress(): Promise<string> {
 
 // ------------------------------------------------------------ media pipeline
 
+/** Human label shared by the log and the controller's screen picker. */
+function displayLabel(d: HostDisplay): string {
+  return `屏幕 ${d.index + 1}${d.primary ? '（主屏）' : ''} ${d.width}x${d.height}@${d.refreshRate}Hz`;
+}
+
+function displayDescriptors(): DisplayDescriptor[] {
+  return hostDisplays.map((d) => ({
+    index: d.index,
+    name: d.name,
+    primary: d.primary,
+    width: d.width,
+    height: d.height,
+    refreshRate: d.refreshRate,
+  }));
+}
+
+/**
+ * Point the injector at the display being controlled. Absolute moves are
+ * mapped through that display's rectangle (see frameToVirtual), so input
+ * physically cannot land on another monitor.
+ */
+function aimInjector(): void {
+  if (!active || active.role !== 'host') return;
+  const sel = hostDisplays[active.displayIndex];
+  if (!sel) return;
+  injector.setTarget(
+    { x: sel.x, y: sel.y, width: sel.width, height: sel.height },
+    virtualBounds(hostDisplays),
+  );
+}
+
+/** Tell both the controller (data channel) and this UI what can be picked. */
+function sendDisplayList(): void {
+  if (!active) return;
+  sendUi({ type: 'displays', displays: displayDescriptors(), active: active.displayIndex });
+  if (active.role === 'host') {
+    active.session.sendControl({
+      t: 'displays',
+      displays: displayDescriptors(),
+      active: active.displayIndex,
+    });
+  }
+}
+
+/**
+ * Move capture + control to another display at the controller's request.
+ * Only the selected screen is captured and injected into; other displays
+ * are never touched — in particular the panel takeover (resolution switch
+ * and DDC dimming, which by design affect the primary and every panel's
+ * brightness) is handed back before capture moves off the primary, and is
+ * not re-applied when switching back mid-session.
+ */
+async function switchDisplay(index: number): Promise<void> {
+  const current = active;
+  if (!current || current.role !== 'host') return;
+  // Re-enumerate first: monitors get plugged and unplugged between sessions.
+  hostDisplays = await listDisplays(preset.fps);
+  if (!active || active !== current) return;
+  const next = hostDisplays[index];
+  if (!next) {
+    sendDisplayList();
+    return;
+  }
+  if (next.index === current.displayIndex) return;
+  current.displayIndex = next.index;
+  log('info', `已切换到${displayLabel(next)}（仅影响此屏）`);
+  if (!next.primary && panelHold) await releasePanel('（切换到非主屏）');
+  if (!active || active !== current) return;
+  aimInjector();
+  current.encoder?.stop();
+  startEncoder(current);
+  sendDisplayList();
+}
+
 function startEncoder(target: ActiveSession): void {
   // Frames queued for the previous encoder belong to a reference chain that the
   // new keyframe replaces; sending them only delays the useful picture.
@@ -451,10 +574,15 @@ function startEncoder(target: ActiveSession): void {
   // A fresh encoder already emits an IDR, so an IDR request arriving right after
   // the session starts must not tear it down again.
   lastKeyframeRestart = Date.now();
-  const { width, height, scaled } = negotiateSize(display, peerDisplay);
+  // Capture follows the display the controller picked (the primary until
+  // they say otherwise); geometry negotiation is against that panel, not
+  // the primary the process happened to start with.
+  const sel = target.role === 'host' ? (hostDisplays[target.displayIndex] ?? null) : null;
+  const capture = sel ?? display;
+  const { width, height, scaled } = negotiateSize(capture, peerDisplay);
   const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
-  let bitrateKbps = scaled ? scaleBitrate(presetKbps, display, { width, height }) : presetKbps;
+  let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
   // encoder produce faster than the path has proven it can carry. Without
   // this the encoder kept emitting the full preset rate into a saturated
@@ -463,7 +591,15 @@ function startEncoder(target: ActiveSession): void {
   if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
-    source: values.source === 'test' ? { kind: 'test', size: `${display.width}x${display.height}` } : { kind: 'screen', mode: 'auto' },
+    source:
+      values.source === 'test'
+        ? { kind: 'test', size: `${capture.width}x${capture.height}` }
+        : {
+            kind: 'screen',
+            mode: 'auto',
+            outputIndex: sel?.index,
+            rect: sel ? { x: sel.x, y: sel.y, width: sel.width, height: sel.height } : undefined,
+          },
     fps,
     bitrateKbps,
     targetSize: scaled ? { width, height } : undefined,
@@ -518,7 +654,10 @@ function startEncoder(target: ActiveSession): void {
   if (values.source !== 'test') {
     const mode = encoder.captureMode === 'dda' ? 'Desktop Duplication (GPU)' : 'GDI';
     const shape = scaled ? ` · 缩放输出 ${width}x${height} · ${bitrateKbps} kbps` : ` · ${bitrateKbps} kbps`;
-    log('info', `屏幕采集 ${mode} ${display.width}x${display.height}@${fps}${shape}`);
+    log(
+      'info',
+      `屏幕采集 ${mode} ${capture.width}x${capture.height}@${fps}${shape}${sel ? ` · ${displayLabel(sel)}` : ''}`,
+    );
   }
 }
 
@@ -742,7 +881,11 @@ function endSession(reason: string): void {
   }
   if (current.role === 'host') void releasePanel(reason);
   sendUi({ type: 'session-end', reason });
-  log('info', `会话结束 ${reason}`);
+  log(
+    'info',
+    `会话结束 ${reason} · 时长 ${Math.max(0, Math.round((Date.now() - current.startedAt) / 1000))}s · 路由 ${current.route}`,
+  );
+  if (lastStatsLine) log('info', `结束时统计 ${lastStatsLine}`);
   rotateOnceCode();
 }
 
@@ -872,8 +1015,20 @@ async function startSession(
   }
   // Hand the panel over before anything is captured, so the encoder, the injector
   // and the geometry advertised to the peer all see the final screen.
-  if (role === 'host' && state.handOverDisplay) {
-    await takeOverPanel(negotiateSize(display, peerDisplay));
+  if (role === 'host') {
+    hostDisplays = await listDisplays(preset.fps);
+    log(
+      'info',
+      hostDisplays.length > 1
+        ? `检测到 ${hostDisplays.length} 块屏幕：${hostDisplays.map(displayLabel).join(' · ')}，默认主屏`
+        : `单屏 ${displayLabel(hostDisplays[0]!)}`,
+    );
+    if (state.handOverDisplay) {
+      await takeOverPanel(negotiateSize(display, peerDisplay));
+      // The takeover may have changed the primary's mode; re-read the sizes
+      // so capture geometry and the screen picker describe reality.
+      hostDisplays = await listDisplays(preset.fps);
+    }
   }
   // The host resizes its output to the controller's viewport; the controller
   // reports its own screen so the host knows what to aim for.
@@ -906,13 +1061,21 @@ async function startSession(
     sessionId: msg.sessionId,
     initialBitrateBps: Math.min(preset.netKbps * 1000, START_NET_BPS),
     maxBitrateBps: preset.netKbps * 1000,
-    logger: (level, message) => log(level === 'debug' ? 'info' : level, message),
+    logger: logger.child('session'),
     onInput: (event) => injector.inject(event),
     onFrame: (frame) => onIncomingFrame(frame),
     onControl: (ctl) => {
       lastPeerAt = Date.now();
       if (ctl.t === 'bye') {
         endSession(ctl.reason ?? '对方已断开');
+        return;
+      }
+      if (ctl.t === 'displays' && role === 'controller') {
+        sendUi({ type: 'displays', displays: ctl.displays, active: ctl.active });
+        return;
+      }
+      if (ctl.t === 'select-display' && role === 'host') {
+        void switchDisplay(Math.round(ctl.index));
         return;
       }
       if (ctl.t === 'resize' && role === 'host' && active) {
@@ -952,7 +1115,24 @@ async function startSession(
         startEncoder(active);
       }
     },
-    onStats: (s) => sendUi({ type: 'stats', stats: toDto(s) }),
+    onStats: (s) => {
+      sendUi({ type: 'stats', stats: toDto(s) });
+      // A 10 s stats heartbeat in the log file is what makes "it stuttered
+      // around 21:40" answerable after the fact: the live UI numbers are
+      // gone the moment the session ends, the file keeps the whole curve.
+      const now = Date.now();
+      if (now - lastStatsLoggedAt < 10_000) return;
+      lastStatsLoggedAt = now;
+      lastStatsLine =
+        `role=${s.role} route=${active?.route ?? '?'} fps=${Math.round(s.fps)} ` +
+        `rtt=${(s.rttUs / 1000).toFixed(1)}ms oneway=${(s.oneWayUs / 1000).toFixed(1)}ms ` +
+        `loss=${s.lossPct}% jitter=${(s.jitterUs / 1000).toFixed(1)}ms ` +
+        `target=${(s.targetBps / 1e6).toFixed(2)}M pacer=${(s.pacerRateBps / 1e6).toFixed(2)}M ` +
+        `send=${(s.sendBps / 1e6).toFixed(2)}M recv=${(s.recvBps / 1e6).toFixed(2)}M ` +
+        `queue=${s.queueBytes}B pending=${s.pendingFrames} drop=${s.droppedFrames} skip=${s.skippedFrames} ` +
+        `fec=${s.recoveredFrames} rxpkts=${s.packetsReceived} authfail=${s.authFailures}`;
+      logger.info('stats', lastStatsLine);
+    },
     onBitrateChange: (bps) => {
       log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`);
       // Feed the congestion verdict back into the encoder (debounced, and
@@ -1017,6 +1197,7 @@ async function startSession(
     sessionId: msg.sessionId,
     peerCandidates: values['force-relay'] ? [] : msg.peerCandidates,
     relayEndpoint: relay,
+    displayIndex: role === 'host' ? primaryDisplayIndex(hostDisplays) : 0,
   };
   wireRelayUpgrade(path);
   lastPeerAt = Date.now();
@@ -1029,6 +1210,8 @@ async function startSession(
     }
     startEncoder(active);
     injector.start();
+    aimInjector();
+    sendDisplayList();
   }
 
   sendUi({
@@ -1110,6 +1293,29 @@ function applyQuality(next: QualityPreset): void {
   log('info', `画质 ${p.label} · ${p.bitrateKbps} kbps`);
 }
 
+/**
+ * Everything a developer needs to diagnose a bad session, in one text file:
+ * environment header, the engine log tail, and the browser-side log the UI
+ * kept. No secrets: access codes and key material are never logged, and the
+ * logger redacts credential-looking assignments on the way in.
+ */
+function buildLogBundle(clientLog?: string): string {
+  const sessionLine = active
+    ? `${active.role} · 对端 ${active.peerName} (${active.peerCode}) · 路由 ${active.route} · 已持续 ${Math.max(0, Math.round((Date.now() - active.startedAt) / 1000))}s`
+    : '无';
+  const header = [
+    'Lumen Remote 日志导出',
+    `生成时间 ${new Date().toISOString()}（本机 ${new Date().toString()}）`,
+    `版本 ${VERSION} · 平台 ${platform()} ${arch()} · Node ${process.version} · pid ${process.pid} · 进程已运行 ${Math.round(process.uptime())}s`,
+    `设备 ${DEVICE_NAME} · 编号 ${deviceCode || '(未上线)'} · 信令 ${state.signalHost}:${state.signalPort} ${signalOnline ? '在线' : '离线'}`,
+    `显示 ${display.width}x${display.height}@${display.fps} · 画质 ${preset.label} ${preset.bitrateKbps}kbps/${preset.fps}fps`,
+    `日志文件 ${logger.filePath} · 级别 ${logger.currentLevel}`,
+    `当前会话 ${sessionLine}`,
+    lastStatsLine ? `最近统计 ${lastStatsLine}` : '最近统计 （无）',
+  ].join('\n');
+  return `${header}\n\n===== 引擎日志（文件尾部） =====\n${logger.exportText()}\n\n===== 界面日志（浏览器） =====\n${clientLog?.trim() ? clientLog.trim() : '（无）'}\n`;
+}
+
 function handleUi(msg: UiToApp): void {
   switch (msg.type) {
     case 'accept':
@@ -1137,6 +1343,11 @@ function handleUi(msg: UiToApp): void {
       break;
     case 'keyframe':
       active?.session.requestKeyframe();
+      break;
+    case 'select-display':
+      if (active?.role === 'controller') {
+        active.session.sendControl({ t: 'select-display', index: Math.round(msg.index) });
+      }
       break;
     case 'client-display':
       if (msg.width > 0 && msg.height > 0) {
@@ -1222,6 +1433,16 @@ function handleUi(msg: UiToApp): void {
       saveState(state);
       sendUi({ type: 'favorites', favorites: state.favorites });
       break;
+    case 'export-logs': {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      sendUi({
+        type: 'log-bundle',
+        filename: `lumen-logs-${stamp}.txt`,
+        text: buildLogBundle(msg.clientLog),
+      });
+      log('info', '已导出日志（设置页「运行日志 → 导出日志」）');
+      break;
+    }
     default:
       break;
   }

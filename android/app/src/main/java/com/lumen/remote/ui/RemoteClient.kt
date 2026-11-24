@@ -31,6 +31,7 @@ class RemoteClient(
     private val onFrame: (IncomingFrame) -> Unit,
     private val onStats: (SessionStats) -> Unit,
     private val onSignalingFailed: (host: String) -> Unit = {},
+    private val onDisplays: (List<DisplayOption>, Int) -> Unit = { _, _ -> },
 ) {
     private var signaling: SignalingClient? = null
     private var link: UdpLink? = null
@@ -228,7 +229,30 @@ class RemoteClient(
             log = log,
             onFrame = onFrame,
             onControl = { msg ->
-                if (msg.optString("t") == "idr") session?.requestKeyframe()
+                when (msg.optString("t")) {
+                    "idr" -> session?.requestKeyframe()
+                    "displays" -> {
+                        val arr = msg.optJSONArray("displays")
+                        val list = ArrayList<DisplayOption>()
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val o = arr.optJSONObject(i) ?: continue
+                                list.add(
+                                    DisplayOption(
+                                        index = o.optInt("index", i),
+                                        name = o.optString("name"),
+                                        primary = o.optBoolean("primary"),
+                                        width = o.optInt("width"),
+                                        height = o.optInt("height"),
+                                        refreshRate = o.optInt("refreshRate", 60),
+                                    ),
+                                )
+                            }
+                        }
+                        log("对方 ${list.size} 块屏幕，当前第 ${msg.optInt("active", 0) + 1} 块")
+                        onDisplays(list, msg.optInt("active", 0))
+                    }
+                }
             },
             onStats = onStats,
         )
@@ -290,6 +314,10 @@ class RemoteClient(
 
     fun requestKeyframe() {
         session?.requestKeyframe()
+    }
+
+    fun selectDisplay(index: Int) {
+        session?.selectDisplay(index)
     }
 
     fun disconnect() {
@@ -367,3 +395,13 @@ private fun unroutableRelay(address: String): Boolean {
     if (Regex("^100\\.(6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.").containsMatchIn(dotted)) return true
     return false
 }
+
+/** One display attached to the host, as offered by the screen picker. */
+data class DisplayOption(
+    val index: Int,
+    val name: String,
+    val primary: Boolean,
+    val width: Int,
+    val height: Int,
+    val refreshRate: Int,
+)

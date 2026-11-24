@@ -22,6 +22,16 @@ export interface NackEntry {
   frags: number[];
 }
 
+/** One display on the host, as offered to the controller's screen picker. */
+export interface DisplayDescriptor {
+  index: number;
+  name: string;
+  primary: boolean;
+  width: number;
+  height: number;
+  refreshRate: number;
+}
+
 export type ControlMessage =
   | {
       t: 'hello';
@@ -50,6 +60,10 @@ export type ControlMessage =
   | { t: 'resize'; width: number; height: number; fps?: number }
   | { t: 'ping'; n: number; t1: number }
   | { t: 'pong'; n: number; t1: number; t2: number; t3: number }
+  /** Host -> controller: the host's displays and which one is being captured. */
+  | { t: 'displays'; displays: DisplayDescriptor[]; active: number }
+  /** Controller -> host: capture and control this display instead. */
+  | { t: 'select-display'; index: number }
   | { t: 'clipboard'; format: 'text' | 'html'; data: string }
   | { t: 'cursor'; visible: boolean; x: number; y: number }
   | { t: 'bye'; reason: string }
