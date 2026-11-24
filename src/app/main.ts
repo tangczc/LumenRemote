@@ -248,6 +248,7 @@ let state = loadState();
 // deviceId) writes the identity to disk before any signalling connects.
 saveState(state);
 let preset = QUALITY_PRESETS[state.quality] ?? QUALITY_PRESETS.balanced;
+let presetKey: QualityPreset = QUALITY_PRESETS[state.quality] ? state.quality : 'balanced';
 
 // ------------------------------------------------------------------ logging
 
@@ -1216,6 +1217,22 @@ async function startSession(
         }
         return;
       }
+      if (ctl.t === 'quality' && role === 'host' && active) {
+        // Session-scoped: the host owner's own saved default is left
+        // untouched; this only steers the running encoder (and the log
+        // says why the fps/bitrate suddenly changed).
+        const key = ctl.preset as QualityPreset;
+        const p = QUALITY_PRESETS[key];
+        if (p && key !== presetKey) {
+          presetKey = key;
+          preset = p;
+          active.session.setMaxBitrate(p.netKbps * 1000);
+          log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
+          active.encoder?.stop();
+          startEncoder(active);
+        }
+        return;
+      }
       if (ctl.t !== 'idr' || role !== 'host' || !active) return;
       const now = Date.now();
       // Restarting the encoder means a pipeline stall plus the largest
@@ -1329,6 +1346,11 @@ async function startSession(
     startDesktopMonitor();
   }
 
+  // The controller's quality choice drives the host's encoder; without
+  // this the host only ever used its own saved preset (default 30 fps).
+  if (role === 'controller') {
+    session.sendControl({ t: 'quality', preset: presetKey });
+  }
   sendUi({
     type: 'session-start',
     role,
@@ -1399,7 +1421,11 @@ function applyQuality(next: QualityPreset): void {
   state = { ...state, quality: next };
   saveState(state);
   preset = p;
+  presetKey = next;
   active?.session.setMaxBitrate(p.netKbps * 1000);
+  if (active?.role === 'controller') {
+    active.session.sendControl({ t: 'quality', preset: next });
+  }
   if (active?.role === 'host' && active.encoder) {
     active.encoder.stop();
     startEncoder(active);

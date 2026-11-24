@@ -486,6 +486,8 @@ function renderSettings() {
   $('#handOverDisplay').checked = s.handOverDisplay !== false;
   $('#blackOutScreen').checked = s.blackOutScreen === true;
   for (const chip of $$('#qualityChips .chip')) chip.classList.toggle('active', chip.dataset.preset === s.quality);
+  const qualitySelect = $('#qualitySelect');
+  if (qualitySelect && qualitySelect.value !== s.quality) qualitySelect.value = s.quality;
 }
 
 function renderFavorites() {
@@ -1142,6 +1144,13 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#qualitySelect')?.addEventListener('change', (ev) => {
+    // Goes to our engine, which applies it locally and (as controller)
+    // forwards it to the host — the host is the one encoding.
+    send({ type: 'quality', preset: ev.target.value });
+    const label = ev.target.selectedOptions?.[0]?.textContent ?? ev.target.value;
+    toast(`画质已切换：${label}（被控将重启编码，画面会顿一下）`);
+  });
   $('#viewMode')?.addEventListener('change', (ev) => {
     applyViewMode(ev.target.value);
     if (ev.target.value === 'hd') toast('高清适应：按对方原始分辨率传输（更清晰，更耗带宽）');
