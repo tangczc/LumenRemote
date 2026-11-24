@@ -164,12 +164,156 @@ public static class RDInject
 }
 "@
 
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+/**
+ * Driver-level injection via the Interception library (optional).
+ * SendInput events carry an "injected" flag that games and anti-cheat
+ * layers can filter, and UIPI silently drops them for elevated
+ * windows. Strokes sent through a kernel HID driver enter the input
+ * stack exactly like physical hardware: no flag, Raw Input visible,
+ * integrity-proof. Every method returns false when the driver path
+ * cannot deliver, and the caller falls back to SendInput per event,
+ * so a half-working driver setup degrades instead of going silent.
+ */
+public static class RDHid
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MouseStroke { public ushort state; public ushort flags; public short rolling; public int x; public int y; public uint information; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KeyStroke { public ushort code; public ushort state; public uint information; }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadLibrary(string path);
+
+    [DllImport("interception.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr interception_create_context();
+
+    [DllImport("interception.dll", EntryPoint = "interception_send", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int SendMouseStroke(IntPtr ctx, int device, ref MouseStroke stroke, uint count);
+
+    [DllImport("interception.dll", EntryPoint = "interception_send", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int SendKeyStroke(IntPtr ctx, int device, ref KeyStroke stroke, uint count);
+
+    private static IntPtr ctx = IntPtr.Zero;
+    private static int mouseDevice = -1;
+    private static int keyDevice = 1;
+
+    public static bool TryInit(string[] candidatePaths)
+    {
+        bool loaded = false;
+        foreach (string p in candidatePaths)
+        {
+            if (!string.IsNullOrEmpty(p) && LoadLibrary(p) != IntPtr.Zero) { loaded = true; break; }
+        }
+        if (!loaded) loaded = LoadLibrary("interception.dll") != IntPtr.Zero;
+        if (!loaded) return false;
+        try { ctx = interception_create_context(); } catch { return false; }
+        if (ctx == IntPtr.Zero) return false; // library present, driver not installed
+        // Probe for a live mouse device with a harmless zero stroke.
+        for (int d = 11; d <= 20; d++)
+        {
+            MouseStroke s = new MouseStroke();
+            try { if (SendMouseStroke(ctx, d, ref s, 1) == 1) { mouseDevice = d; break; } }
+            catch { return false; }
+        }
+        return mouseDevice > 0;
+    }
+
+    private static bool Send(ref MouseStroke s)
+    {
+        if (ctx == IntPtr.Zero || mouseDevice < 0) return false;
+        try { return SendMouseStroke(ctx, mouseDevice, ref s, 1) == 1; } catch { return false; }
+    }
+
+    public static bool MoveRelative(int dx, int dy)
+    {
+        MouseStroke s = new MouseStroke();
+        s.x = dx; s.y = dy;
+        return Send(ref s);
+    }
+
+    public static bool MoveAbsolute(int nx, int ny)
+    {
+        MouseStroke s = new MouseStroke();
+        s.flags = 0x001 | 0x002; // ABSOLUTE | VIRTUAL_DESKTOP, 0..65535 like SendInput
+        s.x = nx; s.y = ny;
+        return Send(ref s);
+    }
+
+    public static bool Button(int button, bool down)
+    {
+        MouseStroke s = new MouseStroke();
+        switch (button)
+        {
+            case 0: s.state = down ? (ushort)0x001 : (ushort)0x002; break;
+            case 1: s.state = down ? (ushort)0x004 : (ushort)0x008; break;
+            case 2: s.state = down ? (ushort)0x010 : (ushort)0x020; break;
+            case 3: s.state = down ? (ushort)0x040 : (ushort)0x080; break;
+            default: s.state = down ? (ushort)0x100 : (ushort)0x200; break;
+        }
+        return Send(ref s);
+    }
+
+    public static bool Wheel(int delta)
+    {
+        MouseStroke s = new MouseStroke();
+        s.state = 0x400;
+        s.rolling = (short)delta;
+        return Send(ref s);
+    }
+
+    public static bool Key(int scan, int vk, bool down)
+    {
+        if (scan == 0) return false; // vk-only event: driver path cannot express it
+        KeyStroke s = new KeyStroke();
+        s.code = (ushort)(scan & 0xFF);
+        s.state = down ? (ushort)0 : (ushort)1;
+        if ((vk & 0x100) != 0 || scan > 0xFF) s.state |= 0x02; // E0 extended
+        if (ctx == IntPtr.Zero) return false;
+        try
+        {
+            if (SendKeyStroke(ctx, keyDevice, ref s, 1) == 1) return true;
+            // First keyboard may not live at index 1 on this machine.
+            for (int d = 1; d <= 10; d++)
+            {
+                if (d == keyDevice) continue;
+                if (SendKeyStroke(ctx, d, ref s, 1) == 1) { keyDevice = d; return true; }
+            }
+        }
+        catch { }
+        return false;
+    }
+}
+"@
+
 # The engine writes UTF-8, but Console.In decodes with the OEM code page, which
 # turns Chinese text into mojibake before it ever reaches SendInput.
 $stdin = New-Object System.IO.StreamReader(
     [Console]::OpenStandardInput(),
     (New-Object System.Text.UTF8Encoding($false)))
 [RDInject]::MakeDpiAware()
+
+# Optional driver-level backend (see RDHid above). Probed once at
+# startup; the mode is reported on stderr so the host log states
+# plainly which path input took ("注入器 backend=...").
+$hidReady = $false
+try
+{
+    $dllCandidates = @(
+        $env:RD_INTERCEPTION_DLL,
+        (Join-Path $PSScriptRoot 'interception.dll'),
+        (Join-Path (Get-Location) 'interception.dll')
+    )
+    $hidReady = [RDHid]::TryInit($dllCandidates)
+}
+catch { $hidReady = $false }
+if ($hidReady) { [Console]::Error.WriteLine('backend=interception') }
+else { [Console]::Error.WriteLine('backend=sendinput') }
+
 while ($null -ne ($line = $stdin.ReadLine()))
 {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -178,12 +322,12 @@ while ($null -ne ($line = $stdin.ReadLine()))
     {
         switch ($p[0])
         {
-            'mm' { [RDInject]::MoveRelative([int]$p[1], [int]$p[2]) }
-            'ma' { [RDInject]::MoveAbsolute([int]$p[1], [int]$p[2]) }
-            'mb' { [RDInject]::Button([int]$p[1], [bool]::Parse($p[2])) }
-            'mw' { [RDInject]::Wheel([int]$p[1]) }
-            'kd' { [RDInject]::Key([int]$p[1], [int]$p[2], $true) }
-            'ku' { [RDInject]::Key([int]$p[1], [int]$p[2], $false) }
+            'mm' { $ok = $false; if ($hidReady) { $ok = [RDHid]::MoveRelative([int]$p[1], [int]$p[2]) }; if (-not $ok) { [RDInject]::MoveRelative([int]$p[1], [int]$p[2]) } }
+            'ma' { $ok = $false; if ($hidReady) { $ok = [RDHid]::MoveAbsolute([int]$p[1], [int]$p[2]) }; if (-not $ok) { [RDInject]::MoveAbsolute([int]$p[1], [int]$p[2]) } }
+            'mb' { $ok = $false; if ($hidReady) { $ok = [RDHid]::Button([int]$p[1], [bool]::Parse($p[2])) }; if (-not $ok) { [RDInject]::Button([int]$p[1], [bool]::Parse($p[2])) } }
+            'mw' { $ok = $false; if ($hidReady) { $ok = [RDHid]::Wheel([int]$p[1]) }; if (-not $ok) { [RDInject]::Wheel([int]$p[1]) } }
+            'kd' { $ok = $false; if ($hidReady) { $ok = [RDHid]::Key([int]$p[1], [int]$p[2], $true) }; if (-not $ok) { [RDInject]::Key([int]$p[1], [int]$p[2], $true) } }
+            'ku' { $ok = $false; if ($hidReady) { $ok = [RDHid]::Key([int]$p[1], [int]$p[2], $false) }; if (-not $ok) { [RDInject]::Key([int]$p[1], [int]$p[2], $false) } }
             'kr' { [RDInject]::TypeText([string]::Join(',', $p[1..($p.Length - 1)])) }
         }
     }

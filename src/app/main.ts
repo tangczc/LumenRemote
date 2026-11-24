@@ -662,8 +662,16 @@ function startForegroundMonitor(): void {
         info.height >= sel.height;
       log(
         'info',
-        `前台应用：${info.name} · 窗口 ${info.width}x${info.height}@${info.x},${info.y}${full ? '（全屏覆盖）' : ''}`,
+        `前台应用：${info.name} · 窗口 ${info.width}x${info.height}@${info.x},${info.y}${full ? '（全屏覆盖）' : ''} · 完整性 ${info.integrity}`,
       );
+    },
+    onSelfIntegrity: (integrity) => {
+      // The injector is spawned from this process, so synthetic input
+      // originates at this level too. If a foreground game logs 高
+      // while this says 中, Windows (UIPI) is dropping our input
+      // before the game ever sees it — a different wall than games
+      // filtering injected-flag events, with a different fix.
+      log('info', `本机进程完整性：${integrity}（注入器同级，合成输入的出发级别）`);
     },
   });
   foregroundMonitor.start();
