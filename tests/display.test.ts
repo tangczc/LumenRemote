@@ -7,6 +7,7 @@ import {
   type HostDisplay,
 } from '../src/host/display.ts';
 import { frameToVirtual } from '../src/host/injector.ts';
+import { isSecureDesktopName } from '../src/host/secure-desktop.ts';
 import { decodeControl, encodeControl } from '../src/protocol/messages.ts';
 
 const modes: DisplayMode[] = [
@@ -146,5 +147,25 @@ describe('display control messages', () => {
     const pick = decodeControl(encodeControl({ t: 'select-display', index: 1 }));
     assert.equal(pick?.t, 'select-display');
     if (pick?.t === 'select-display') assert.equal(pick.index, 1);
+  });
+});
+
+describe('secure desktop detection', () => {
+  test('only the Winlogon desktop counts as secure', () => {
+    // UAC consent and the lock screen live here; everything a user app
+    // captures or clicks is suspended while it owns the screen.
+    assert.equal(isSecureDesktopName('Winlogon'), true);
+    assert.equal(isSecureDesktopName('winlogon'), true);
+    assert.equal(isSecureDesktopName('Default'), false);
+    assert.equal(isSecureDesktopName('unknown'), false);
+    assert.equal(isSecureDesktopName(''), false);
+  });
+
+  test('secure-desktop survives the wire round trip', () => {
+    const on = decodeControl(encodeControl({ t: 'secure-desktop', active: true }));
+    assert.equal(on?.t, 'secure-desktop');
+    if (on?.t === 'secure-desktop') assert.equal(on.active, true);
+    const off = decodeControl(encodeControl({ t: 'secure-desktop', active: false }));
+    if (off?.t === 'secure-desktop') assert.equal(off.active, false);
   });
 });

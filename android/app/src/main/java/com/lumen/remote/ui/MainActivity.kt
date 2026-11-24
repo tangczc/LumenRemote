@@ -96,6 +96,7 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
     private lateinit var connectButton: android.widget.Button
     private lateinit var logText: TextView
     private lateinit var sessionStatsText: TextView
+    private lateinit var secureBanner: TextView
     private lateinit var rightClickButton: android.widget.Button
 
     private var videoWidth = 0
@@ -175,6 +176,9 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
                 }
             },
             onDisplays = { list, active -> runOnUiThread { updateDisplayButton(list, active) } },
+            onSecureDesktop = { activeNow ->
+                runOnUiThread { if (::secureBanner.isInitialized) secureBanner.visibility = if (activeNow) View.VISIBLE else View.GONE }
+            },
             onFrame = { frame -> handleFrame(frame) },
             onStats = { stats -> runOnUiThread { renderStats(stats) } },
             onSignalingFailed = { failedHost ->
@@ -609,6 +613,29 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
             ).apply {
                 gravity = Gravity.TOP
                 setMargins(dp(10f), dp(10f), dp(10f), 0)
+            },
+        )
+
+        // Secure-desktop notice (UAC / lock screen on the host): the video
+        // freezes because Windows isolates that desktop, so say why.
+        secureBanner = body(
+            "对方屏幕上是系统安全提示（UAC）或锁屏，画面已暂停\n请让对方在本机确认，消失后自动恢复",
+            android.graphics.Color.parseColor("#ffd97a"),
+            12f,
+        ).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(14f), dp(10f), dp(14f), dp(10f))
+            background = roundedBackground(android.graphics.Color.parseColor("#e62e2004"), 12f, context = this@MainActivity)
+            visibility = View.GONE
+        }
+        container.addView(
+            secureBanner,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                setMargins(dp(16f), 0, dp(16f), dp(76f))
             },
         )
 

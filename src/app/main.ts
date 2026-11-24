@@ -21,6 +21,7 @@ import { annexBToAvcc, describeStream, type AvcStreamConfig } from '../media/avc
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
 import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
+import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
 import {
   listDisplays,
   primaryDisplayIndex,
@@ -335,6 +336,9 @@ let relayBudget = false;
  * pointer-lock mode, where its own cursor is hidden by the browser.
  */
 let bakeCursor = false;
+/** Secure desktop (UAC / lock screen) currently owns the host's screen. */
+let secureDesktop = { active: false, name: 'Default' };
+let desktopMonitor: SecureDesktopMonitor | null = null;
 /** Encoder crashes absorbed in the current session, so a broken capture cannot loop. */
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
@@ -543,6 +547,37 @@ function sendDisplayList(): void {
 }
 
 /**
+ * Follow the host's input desktop during a session. When the secure
+ * desktop (UAC consent, lock screen) takes the screen, Windows suspends
+ * both capture and injection for a user-level process: tell the
+ * controller immediately so it can show "waiting for a local click"
+ * instead of a dead black screen, and revive the encoder on return.
+ */
+function startDesktopMonitor(): void {
+  desktopMonitor?.stop();
+  desktopMonitor = new SecureDesktopMonitor({
+    log,
+    onChange: (nowSecure, name) => {
+      secureDesktop = { active: nowSecure, name };
+      if (!active || active.role !== 'host') return;
+      active.session.sendControl({ t: 'secure-desktop', active: nowSecure });
+      sendUi({ type: 'secure-desktop', active: nowSecure });
+      if (nowSecure) {
+        log(
+          'warn',
+          `检测到安全桌面（${name}，通常是 UAC 管理员弹窗或锁屏）：远程画面与点击已暂停，已通知主控等待本地确认`,
+        );
+      } else {
+        log('info', '已回到普通桌面，远程画面恢复');
+        autoRestarts = 0;
+        if (active.encoder && !active.encoder.running) startEncoder(active);
+      }
+    },
+  });
+  desktopMonitor.start();
+}
+
+/**
  * Move capture + control to another display at the controller's request.
  * Only the selected screen is captured and injected into; other displays
  * are never touched — in particular the panel takeover (resolution switch
@@ -640,6 +675,13 @@ function startEncoder(target: ActiveSession): void {
       // the user has no way to revive it from the controller.
       const current = active;
       if (!current || current.role !== 'host') return;
+      if (secureDesktop.active) {
+        // Expected: Windows took the screen away (UAC / lock). Do not burn
+        // the crash budget on it — the desktop monitor restarts capture
+        // when the normal desktop comes back.
+        log('info', '编码器随安全桌面暂停，桌面恢复后自动重启');
+        return;
+      }
       if (autoRestarts >= 3) {
         log('error', '编码器多次异常退出，已停止自动重启（检查显卡驱动或是否有其他远控软件占用桌面复制）');
         return;
@@ -885,6 +927,9 @@ function endSession(reason: string): void {
     current.session.close(reason);
     if (current.role === 'host') injector.stop();
   }
+  desktopMonitor?.stop();
+  desktopMonitor = null;
+  secureDesktop = { active: false, name: 'Default' };
   if (current.role === 'host') void releasePanel(reason);
   sendUi({ type: 'session-end', reason });
   log(
@@ -1077,6 +1122,15 @@ async function startSession(
         endSession(ctl.reason ?? '对方已断开');
         return;
       }
+      if (ctl.t === 'secure-desktop' && role === 'controller') {
+        sendUi({ type: 'secure-desktop', active: ctl.active });
+        if (ctl.active) {
+          log('warn', '对方屏幕被系统安全提示占用（UAC/锁屏），画面已暂停，等待对方本地确认');
+        } else {
+          log('info', '对方已确认系统提示，画面恢复');
+        }
+        return;
+      }
       if (ctl.t === 'displays' && role === 'controller') {
         sendUi({ type: 'displays', displays: ctl.displays, active: ctl.active });
         return;
@@ -1228,6 +1282,7 @@ async function startSession(
     injector.start();
     aimInjector();
     sendDisplayList();
+    startDesktopMonitor();
   }
 
   sendUi({

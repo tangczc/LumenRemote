@@ -354,6 +354,17 @@ function handleServer(msg) {
       renderDisplayPicker(msg.displays ?? [], msg.active ?? 0);
       break;
 
+    case 'secure-desktop': {
+      // The host's screen belongs to Windows' secure desktop (UAC/lock):
+      // say so loudly instead of leaving a frozen black stage that looks
+      // like a dead connection. Input stays enabled underneath — if the
+      // detection was wrong, clicks still land.
+      const banner = $('#secureBanner');
+      if (banner && state.session?.role !== 'host') banner.hidden = !msg.active;
+      if (msg.active) toast('对方正在处理系统安全提示，画面暂停中…', 'warn');
+      break;
+    }
+
     case 'stats':
       state.stats = msg.stats;
       renderStats(msg.stats);
@@ -542,6 +553,8 @@ function openRequest(msg) {
 
 function enterSession(msg) {
   state.session = msg;
+  const banner = $('#secureBanner');
+  if (banner) banner.hidden = true;
   state.decodedFrames = 0;
   state.lastOneWayMs = null;
   $('#requestModal').hidden = true;
@@ -626,6 +639,8 @@ function renderDisplayPicker(displays, active) {
 
 function exitSession(reason) {
   state.session = null;
+  const banner = $('#secureBanner');
+  if (banner) banner.hidden = true;
   if (document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => {});
   const select = $('#displaySelect');
   if (select) {
