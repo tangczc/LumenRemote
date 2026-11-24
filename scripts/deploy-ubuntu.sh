@@ -299,7 +299,13 @@ Restart=always
 RestartSec=2
 LimitNOFILE=65535
 
-# 这个服务只碰网络，不需要写系统任何位置
+# 日志目录交给 systemd 建：ProtectSystem=strict 下 /opt 是只读的，
+# 只有 LogsDirectory 会被自动加进 ReadWritePaths。
+LogsDirectory=$SERVICE
+LogsDirectoryMode=0750
+Environment=RD_LOG_DIR=/var/log/$SERVICE
+
+# 这个服务除了自己的日志目录，不写系统任何位置
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

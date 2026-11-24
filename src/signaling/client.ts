@@ -30,8 +30,10 @@ export class SignalingClient {
   private socket: Socket | null = null;
   private decoder: LineDecoder<ServerToClient>;
   private handlers = new Set<(msg: ServerToClient) => void>();
+  private closeHandlers = new Set<() => void>();
   private welcomeResolve: ((w: Welcome) => void) | null = null;
   private closed = false;
+  private intentionalClose = false;
   welcome: Welcome | null = null;
 
   constructor(private readonly opts: SignalingClientOptions) {
@@ -96,7 +98,11 @@ export class SignalingClient {
     this.welcomeResolve = null;
     socket.on('close', () => {
       this.closed = true;
+      // Our own close() is a server switch or a shutdown; treating it as a
+      // dropped connection would trigger a reconnect that fights the caller.
+      if (this.intentionalClose) return;
       this.opts.log?.('warn', 'signaling connection lost');
+      for (const cb of this.closeHandlers) cb();
     });
     socket.on('error', (err) => this.opts.log?.('error', `signaling: ${err.message}`));
     return welcome;
@@ -111,11 +117,17 @@ export class SignalingClient {
     this.handlers.add(cb);
   }
 
+  /** Fires when the server dropped us — not when we call close() ourselves. */
+  onClose(cb: () => void): void {
+    this.closeHandlers.add(cb);
+  }
+
   offMessage(cb: (msg: ServerToClient) => void): void {
     this.handlers.delete(cb);
   }
 
   close(): void {
+    this.intentionalClose = true;
     this.closed = true;
     try {
       this.socket?.destroy();

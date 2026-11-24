@@ -83,12 +83,19 @@ test('logged messages are redacted before they reach disk', (t) => {
 });
 
 test('a broken log directory never throws', (t) => {
+  const warn = t.mock.method(console, 'warn', () => {});
   const dir = tempDir(t);
   const fileAsDir = join(dir, 'not-a-dir');
   writeFileSync(fileAsDir, 'x');
   const logger = new AppLogger({ dir: join(fileAsDir, 'logs'), name: 'lumen' });
   assert.doesNotThrow(() => logger.info('app', 'still fine'));
+  assert.doesNotThrow(() => logger.info('app', 'still fine again'));
   assert.match(logger.recentText(), /still fine/);
+  // Degrading silently is what hid a root-owned log dir on the server: warn once.
+  assert.equal(warn.mock.callCount(), 1);
+  const firstWarning = warn.mock.calls[0];
+  assert.ok(firstWarning);
+  assert.match(String(firstWarning.arguments[0]), /文件日志已停用/);
 });
 
 test('parseLogLevel accepts known levels and falls back otherwise', () => {

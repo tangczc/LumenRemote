@@ -100,6 +100,18 @@ $env:ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-bu
 npm run dist
 ```
 
+不想联网、或 `npm run dist` 一直卡在下载 electron 时，用仓库里的脚本（改用本机
+`%LOCALAPPDATA%\electron\Cache` 里已经下过的运行时，全程离线）：
+
+```powershell
+.\scripts\build-win.ps1                            # 环境检查 + typecheck + 单测 + build:engine + 出包
+.\scripts\build-win.ps1 -SkipChecks                # 跳过检查，只出包
+.\scripts\build-win.ps1 -Output out-build -Clean   # 换输出目录（release 被占用时），并清理解压出的运行时
+```
+
+脚本会顺手校验「包内引擎 == 本次 build」和「包内带 ffmpeg」，最后打印安装包大小与路径。
+超过一次 `EBUSY` 时会自动等 10 秒重试一轮。
+
 **ffmpeg 随包发布**：把 `ffmpeg.exe` 放到 `vendor/ffmpeg/`（该目录不进仓库，需自备；`npm run build:engine`
 会拷进 `build/ffmpeg/`，`extraResources` 再带进安装包的 `resources/engine/ffmpeg/`）。
 不打包的话，一台没装过 ffmpeg 的电脑被控时会直接 `spawn ffmpeg ENOENT`：没有画面，

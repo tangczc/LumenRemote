@@ -392,6 +392,27 @@ async function refreshDiscovery(): Promise<void> {
 }
 let deviceCode = '';
 let signalOnline = false;
+let signalReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let signalReconnectDelayMs = 2_000;
+let signalFailNotified = false;
+let shuttingDown = false;
+
+/**
+ * A dropped signaling socket used to mean "offline until the app restarts"
+ * (a server deploy left every client unreachable). Retry with backoff instead;
+ * an active UDP session keeps running while we re-register.
+ */
+function scheduleSignalReconnect(): void {
+  if (shuttingDown || signalReconnectTimer) return;
+  const delay = signalReconnectDelayMs;
+  signalReconnectDelayMs = Math.min(signalReconnectDelayMs * 2, 30_000);
+  log('warn', `信令已断开，${Math.round(delay / 1000)} 秒后重连`);
+  signalReconnectTimer = setTimeout(() => {
+    signalReconnectTimer = null;
+    void connectSignaling();
+  }, delay);
+  signalReconnectTimer.unref?.();
+}
 
 function toDto(s: {
   fps: number;
@@ -735,6 +756,10 @@ function onIncomingFrame(frame: IncomingFrame): void {
 // ------------------------------------------------------------- signalling
 
 async function connectSignaling(): Promise<void> {
+  if (signalReconnectTimer) {
+    clearTimeout(signalReconnectTimer);
+    signalReconnectTimer = null;
+  }
   signaling?.close();
   signaling = null;
   signalOnline = false;
@@ -761,6 +786,8 @@ async function connectSignaling(): Promise<void> {
       saveState(state);
     }
     signalOnline = true;
+    signalReconnectDelayMs = 2_000;
+    signalFailNotified = false;
     signalUdpPort = welcome.udpPort;
     discovery = await discoverUdpEndpoint(link.raw, state.signalHost, welcome.udpPort);
     lastDiscoveryAt = Date.now();
@@ -768,10 +795,21 @@ async function connectSignaling(): Promise<void> {
     log('info', `设备 ID ${deviceCode} · 信令 ${state.signalHost}:${state.signalPort}`);
     emitDevice();
     client.onMessage((msg) => void onSignaling(msg));
+    client.onClose(() => {
+      if (signaling !== client) return;
+      signalOnline = false;
+      deviceCode = '';
+      emitDevice();
+      scheduleSignalReconnect();
+    });
   } catch (err) {
     log('error', `无法连接信令服务: ${(err as Error).message}`);
     emitDevice();
-    sendUi({ type: 'notice', level: 'error', message: `信令服务不可达 (${state.signalHost}:${state.signalPort})` });
+    if (!signalFailNotified) {
+      signalFailNotified = true;
+      sendUi({ type: 'notice', level: 'error', message: `信令服务不可达 (${state.signalHost}:${state.signalPort})` });
+    }
+    scheduleSignalReconnect();
   }
 }
 
@@ -1663,6 +1701,7 @@ if (values.code) {
 }
 
 process.on('SIGINT', () => {
+  shuttingDown = true;
   endSession('应用退出');
   signaling?.close();
   ui?.close();

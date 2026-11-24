@@ -98,6 +98,10 @@ export function resolveCaptureMode(opts: EncoderOptions, ffmpegPath = 'ffmpeg'):
   if (opts.source.kind !== 'screen') return 'gdi';
   const mode = opts.source.mode ?? 'auto';
   if (mode === 'gdi') return 'gdi';
+  // An explicit `dda` request is honoured without probing: the caller has
+  // already decided, and a missing ddagrab still degrades safely because
+  // ScreenEncoder falls back to gdigrab on the first non-zero exit.
+  if (mode === 'dda') return 'dda';
   // Desktop Duplication for every encoder, not just NVENC. The old
   // reasoning — "software encoders download the frames anyway, so GDI is
   // no worse" — confused the download with the capture: gdigrab's BitBlt
