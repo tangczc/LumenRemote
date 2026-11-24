@@ -197,6 +197,7 @@ export class Session {
   private timers: NodeJS.Timeout[] = [];
   private closed = false;
   private lastTargetBps = 0;
+  private lastNotifiedBps = 0;
   private lastMigrateMs = 0;
 
   /** Follow an authenticated peer to its new endpoint (see onPacket). */
@@ -699,6 +700,7 @@ export class Session {
     const target = this.cc.targetBps;
     if (Math.abs(target - this.pacer.rate) / Math.max(1, this.pacer.rate) > 0.03) {
       this.pacer.setRate(target);
+      this.lastNotifiedBps = target;
       this.opts.onBitrateChange?.(target);
     }
   }
@@ -828,6 +830,20 @@ export class Session {
     this.txBytes = 0;
     this.rxBytes = 0;
     this.opts.onStats(stats);
+    // Re-notify the settled target: onReport only speaks when the target
+    // moves, so a verdict the listener deliberately debounce-skipped
+    // (encoder restart pacing) was never delivered again once the
+    // target stopped changing — the encoder stayed at a stale rate
+    // for the rest of the session.
+    const target = this.cc.targetBps;
+    if (
+      this.opts.onBitrateChange &&
+      this.lastNotifiedBps > 0 &&
+      Math.abs(target - this.lastNotifiedBps) / this.lastNotifiedBps > 0.03
+    ) {
+      this.lastNotifiedBps = target;
+      this.opts.onBitrateChange(target);
+    }
   }
 
   private buildStats(): SessionStats {

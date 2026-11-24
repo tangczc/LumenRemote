@@ -1265,7 +1265,7 @@ async function startSession(
         if (p && key !== presetKey) {
           presetKey = key;
           preset = p;
-          active.session.setMaxBitrate(p.netKbps * 1000);
+          active.session.setMaxBudget(qualityCeilingBps(p));
           log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
           if (key === 'uhd' && panelHold?.applied) {
             // The panel was taken over (switched down) at session start,
@@ -1324,9 +1324,10 @@ async function startSession(
       // Feed the congestion verdict back into the encoder (debounced, and
       // only on a material change): pacing alone cannot fix an encoder that
       // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
-      if (!active || active.role !== 'host' || !active.encoder) return;
+      // No encoder yet (path still probing) is not a reason to drop the
+      // verdict: record it, and startEncoder picks it up when it starts.
+      if (!active || active.role !== 'host') return;
       const now = Date.now();
-      if (now - lastBitrateAdaptAt < 8000) return;
       const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
       const current = adaptedBitrateKbps > 0 ? adaptedBitrateKbps : preset.bitrateKbps;
       // Wide hysteresis: restarting the encoder costs a pipeline stall
@@ -1337,13 +1338,21 @@ async function startSession(
       const drop = kbps < current * 0.6;
       const recover = adaptedBitrateKbps > 0 && kbps > current * 1.5;
       if (!drop && !recover) return;
+      // Recoveries may land every 3 s: the old flat 8 s cadence meant a
+      // 4K stream spent its first half-minute climbing 2.4M -> 45M in
+      // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
+      // Drops keep the calm 8 s cadence — that direction is the one
+      // that thrashes on a variable link.
+      if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
       lastBitrateAdaptAt = now;
       adaptedBitrateKbps = kbps;
       if (drop) bitrateStarved = true;
       if (kbps >= preset.bitrateKbps * 0.6) bitrateStarved = false;
       log('info', `按网络状况调整编码码率至 ${kbps} kbps`);
-      active.encoder.stop();
-      startEncoder(active);
+      if (active.encoder) {
+        active.encoder.stop();
+        startEncoder(active);
+      }
     },
   });
   session.start();
@@ -1472,6 +1481,12 @@ function isInputEvent(value: unknown): value is InputEvent {
   return k === 'mm' || k === 'ma' || k === 'mb' || k === 'mw' || k === 'kd' || k === 'ku' || k === 'kr';
 }
 
+
+/** Ceiling for a quality preset, honouring the relay budget when on it. */
+function qualityCeilingBps(p: (typeof QUALITY_PRESETS)[QualityPreset]): number {
+  return (relayBudget ? Math.min(p.netKbps, RELAY_NET_KBPS) : p.netKbps) * 1000;
+}
+
 function applyQuality(next: QualityPreset): void {
   const p = QUALITY_PRESETS[next];
   if (!p) return;
@@ -1479,7 +1494,7 @@ function applyQuality(next: QualityPreset): void {
   saveState(state);
   preset = p;
   presetKey = next;
-  active?.session.setMaxBitrate(p.netKbps * 1000);
+  if (active) active.session.setMaxBudget(qualityCeilingBps(p));
   if (active?.role === 'controller') {
     active.session.sendControl({ t: 'quality', preset: next });
   }

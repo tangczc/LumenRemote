@@ -805,12 +805,23 @@ function onDecodedFrame(frame) {
   drawFrame(frame);
 }
 
+let lastHudRes = '';
 function drawFrame(frame) {
   if (!frame) return;
   const canvas = $('#screen');
   if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
     canvas.width = frame.displayWidth;
     canvas.height = frame.displayHeight;
+    // Show the resolution actually arriving, not the one requested:
+    // "真4K" is only true when this reads 3840×2160. Anything smaller
+    // means the host panel, the negotiation or the bitrate cap shrank
+    // the stream on its way here (the host log says which).
+    const res = `${frame.displayWidth}×${frame.displayHeight}`;
+    if (res !== lastHudRes) {
+      lastHudRes = res;
+      const el = $('#hudRes');
+      if (el) el.textContent = res;
+    }
   }
   const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
