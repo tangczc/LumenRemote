@@ -338,6 +338,9 @@ let adaptedBitrateKbps = 0;
  * the fitting gate.
  */
 let verdictApplied = false;
+/** Geometry the running encoder was started with (for fit stickiness). */
+let lastEncoderGeom: { width: number; height: number; fps: number; context: string } | null = null;
+let lastGeomChangeAt = 0;
 let lastBitrateAdaptAt = 0;
 /** Since when the congestion verdict has continuously justified a recovery. */
 let pendingRecoverAt = 0;
@@ -776,16 +779,53 @@ function startEncoder(target: ActiveSession): void {
   if (verdictApplied || relayBudget) {
     const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
     if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
-      log(
-        'info',
-        `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
-      );
-      width = fit.width;
-      height = fit.height;
-      fps = fit.fps;
-      scaled = true;
+      // Geometry stickiness: a size change forces the peer to rebuild
+      // its decoder and eats a keyframe burst on the thinnest part of
+      // the link. The congestion verdict wobbles every few seconds, so
+      // refitting on every wobble rebuilt the controller's decoder 104
+      // times in one 285 s session (fps samples of 2 amid the storm).
+      // A modest fit now keeps the running geometry — the new bitrate
+      // still applies, and a same-size restart costs no decoder
+      // rebuild. Only a severe collapse (<50% of the running pixels)
+      // or the first fit after a 20 s quiet window changes size; fps
+      // transitions always apply, since yielding frames for pixels is
+      // the point of the fit. Context changes (viewport / quality /
+      // display) reset the stickiness via the context key.
+      const prev = lastEncoderGeom;
+      const fitPx = fit.width * fit.height;
+      const prevPx = prev ? prev.width * prev.height : 0;
+      const sticky =
+        prev !== null &&
+        prev.context === `${negotiated.width}x${negotiated.height}@${fps}` &&
+        fit.fps === prev.fps &&
+        prevPx > 0 &&
+        fitPx >= prevPx * 0.5 &&
+        fitPx <= prevPx * 1.6 &&
+        Date.now() - lastGeomChangeAt < 20000;
+      if (sticky && prev) {
+        width = prev.width;
+        height = prev.height;
+        fps = prev.fps;
+        scaled = true;
+      } else {
+        log(
+          'info',
+          `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
+        );
+        width = fit.width;
+        height = fit.height;
+        fps = fit.fps;
+        scaled = true;
+        lastGeomChangeAt = Date.now();
+      }
     }
   }
+  lastEncoderGeom = {
+    width,
+    height,
+    fps,
+    context: `${negotiated.width}x${negotiated.height}@${relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps}`,
+  };
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source:
@@ -1291,6 +1331,8 @@ async function startSession(
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
   verdictApplied = false;
+  lastEncoderGeom = null;
+  lastGeomChangeAt = 0;
   lastBitrateAdaptAt = 0;
   pendingRecoverAt = 0;
   lastVerdictBps = 0;
@@ -1347,12 +1389,16 @@ async function startSession(
       if (now - pendingRecoverAt < 3000) return;
     }
     pendingRecoverAt = 0;
-    // Recoveries may land every 3 s: the old flat 8 s cadence meant a
-    // 4K stream spent its first half-minute climbing 2.4M -> 45M in
-    // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
-    // Drops keep the calm 8 s cadence — that direction is the one
-    // that thrashes on a variable link.
-    if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
+    // Both directions now land at most every 8 s. Recoveries used to
+    // get a faster 3 s cadence so a fresh 4K stream would not be
+    // judged by its low-bitrate opening — but on a flapping link each
+    // step is an encoder restart plus a keyframe burst, and the steps
+    // fired every few seconds for entire sessions. With geometry
+    // stickiness a slower climb costs little sharpness and buys a
+    // stable picture; drops keep the same cadence (they were never
+    // the thrashy direction once clamped, and 8 s is still fast
+    // enough to protect the link via the pacer in between).
+    if (now - lastBitrateAdaptAt < 8000) return;
     lastBitrateAdaptAt = now;
     // Recover in steps, not in one leap to the (probing) verdict: a
     // 1.5x step that the link cannot hold is absorbed by the pacer
