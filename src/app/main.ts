@@ -310,6 +310,8 @@ let pendingIncoming:
   | null = null;
 /** Requested viewport of the peer we are hosting for, if it told us. */
 let peerDisplay: SizeRequest | undefined;
+/** Quality the controller asked for in its connect request, if it said. */
+let peerQuality: string | undefined;
 /**
  * Viewport this device asks hosts to encode for. The renderer reports it, so a
  * browser window on a 1080p laptop asks for 1920x1080 even when the engine runs
@@ -884,6 +886,7 @@ async function onSignaling(msg: ServerToClient): Promise<void> {
       }
       pendingIncoming = { sessionId: msg.sessionId, from: msg.from, display: msg.display };
       peerDisplay = msg.display;
+      peerQuality = msg.display?.quality;
       // A code is always required, so the prompt always asks for one.
       sendUi({ type: 'incoming', sessionId: msg.sessionId, from: msg.from, passwordRequired: true });
       log('info', `收到连接请求 ${msg.from.name} (${msg.from.code})`);
@@ -1147,7 +1150,13 @@ async function startSession(
         ? `检测到 ${hostDisplays.length} 块屏幕：${hostDisplays.map(displayLabel).join(' · ')}，默认主屏`
         : `单屏 ${displayLabel(hostDisplays[0]!)}`,
     );
-    if (state.handOverDisplay) {
+    if (state.handOverDisplay && peerQuality === 'uhd') {
+      // 真4K means the panel must stay native: taking it over would
+      // switch a 3840x2160 panel down to the controller's viewport and
+      // the "4K" stream would be an upscale of a smaller desktop —
+      // exactly the soft picture the user is complaining about.
+      log('info', '主控请求真4K：保持本机原生分辨率，不切换面板');
+    } else if (state.handOverDisplay) {
       await takeOverPanel(negotiateSize(display, peerDisplay));
       // The takeover may have changed the primary's mode; re-read the sizes
       // so capture geometry and the screen picker describe reality.
@@ -1257,8 +1266,24 @@ async function startSession(
           preset = p;
           active.session.setMaxBitrate(p.netKbps * 1000);
           log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
-          active.encoder?.stop();
-          startEncoder(active);
+          if (key === 'uhd' && panelHold?.applied) {
+            // The panel was taken over (switched down) at session start,
+            // so the capture source itself is no longer 4K. Restore the
+            // native mode before encoding, or the 4K stream is just an
+            // upscale. Async: display switching takes a second or two.
+            log('info', '主控请求真4K：恢复本机原生分辨率后重新采集');
+            active.encoder?.stop();
+            void (async () => {
+              await releasePanel('（主控请求真4K）');
+              if (!active || active.role !== 'host') return;
+              hostDisplays = await listDisplays(preset.fps);
+              startEncoder(active);
+              sendDisplayList();
+            })();
+          } else {
+            active.encoder?.stop();
+            startEncoder(active);
+          }
         }
         return;
       }
@@ -1432,7 +1457,7 @@ function connectToPeer(codeRaw: string, password?: string): void {
     candidates: ourCandidates(),
     // This device is the controller, so the host should encode for *our* viewport
     // rather than its own screen; that is what makes a same-sized PC feel local.
-    display: { width: controllerSize.width, height: controllerSize.height, fps: preset.fps },
+    display: { width: controllerSize.width, height: controllerSize.height, fps: preset.fps, quality: presetKey },
   });
   sendUi({ type: 'session-state', state: 'waiting', role: 'controller', message: `正在请求 ${target}` });
   log('info', `请求连接 ${target}`);

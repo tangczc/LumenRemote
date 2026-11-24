@@ -243,7 +243,11 @@ function reportClientDisplay() {
   // encoded at the fitted size (half its pixels) and then upscaled by the
   // browser — big and blurry. Native encode downscales in the browser,
   // which stays sharp, at the cost of bandwidth.
-  const native = state.viewMode !== 'fit' ? hostNativeSize() : null;
+  // 真4K (uhd) implies the same request on its own: "4K" that is fitted
+  // to a CSS-pixel stage on a scaled display never carries 4K content,
+  // which is precisely the soft picture users describe as 糊.
+  const wantNative = state.viewMode !== 'fit' || state.settings.quality === 'uhd';
+  const native = wantNative ? hostNativeSize() : null;
   if (native) {
     const width = Math.round(native.width / 2) * 2;
     const height = Math.round(native.height / 2) * 2;
@@ -362,10 +366,16 @@ function handleServer(msg) {
       renderDevice();
       break;
 
-    case 'settings':
+    case 'settings': {
+      const prevQuality = state.settings.quality;
       state.settings = msg.settings;
       renderSettings();
+      // A quality change can change the size we ask the host for (uhd
+      // requests the native resolution); re-report so it takes effect
+      // mid-session instead of on the next resize.
+      if (msg.settings.quality !== prevQuality) scheduleClientDisplay();
       break;
+    }
 
     case 'favorites':
       state.favorites = msg.favorites || [];
