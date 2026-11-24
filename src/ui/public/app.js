@@ -210,6 +210,23 @@ function send(msg) {
 let lastClientDisplay = '';
 let clientDisplayTimer = 0;
 
+/**
+ * Every surface that names the route, painted from one place. The
+ * toolbar badge used to be the only one listening to route upgrades,
+ * so the host-mode mini window kept showing the route from session
+ * start (almost always 中继 — sessions start on the relay and upgrade
+ * seconds later) for the whole session.
+ */
+function paintRoute(route) {
+  const p2p = route === 'p2p';
+  for (const sel of ['#routeBadge', '#hostRoute']) {
+    const el = $(sel);
+    if (!el) continue;
+    el.textContent = p2p ? 'P2P 直连' : '中继转发';
+    el.classList.toggle('relay', !p2p);
+  }
+}
+
 /** The selected host display at its native size, when we know it. */
 function hostNativeSize() {
   const list = state.displays ?? [];
@@ -368,10 +385,8 @@ function handleServer(msg) {
       break;
 
     case 'session-route': {
-      const p2p = msg.route === 'p2p';
-      $('#routeBadge').textContent = p2p ? 'P2P 直连' : '中继转发';
-      $('#routeBadge').classList.toggle('relay', !p2p);
-      if (p2p) toast('已升级为 P2P 直连');
+      paintRoute(msg.route);
+      if (msg.route === 'p2p') toast('已升级为 P2P 直连');
       break;
     }
 
@@ -598,8 +613,7 @@ function enterSession(msg) {
   $('#peerName').textContent = msg.peerName;
   $('#sasCode').textContent = `SAS ${msg.sas}`;
   const p2p = msg.route === 'p2p';
-  $('#routeBadge').textContent = p2p ? 'P2P 直连' : '中继转发';
-  $('#routeBadge').classList.toggle('relay', !p2p);
+  paintRoute(msg.route);
   $('#overlayText').textContent = msg.role === 'controller' ? '正在接收画面…' : '对方正在查看本机屏幕';
   $('#stageOverlay').hidden = msg.role !== 'controller';
   $('#btnConnect').disabled = false;
@@ -631,9 +645,7 @@ function enterHostMode(msg) {
   document.body.classList.remove('host-collapsed');
   $('#hostPeer').textContent = msg.peerName;
   $('#hostSas').textContent = `SAS ${msg.sas}`;
-  const p2p = msg.route === 'p2p';
-  $('#hostRoute').textContent = p2p ? 'P2P 直连' : '中继转发';
-  $('#hostRoute').classList.toggle('relay', !p2p);
+  paintRoute(msg.route);
   $('#hostFps').textContent = '—';
   $('#hostLatency').textContent = '—';
   $('#hostBitrate').textContent = '—';
