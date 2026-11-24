@@ -19,7 +19,7 @@ import type { InputEvent } from '../protocol/messages.ts';
 import { splitAnnexB } from '../media/nal.ts';
 import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
-import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
+import { capSizeForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
 import {
@@ -248,6 +248,7 @@ let state = loadState();
 // deviceId) writes the identity to disk before any signalling connects.
 saveState(state);
 let preset = QUALITY_PRESETS[state.quality] ?? QUALITY_PRESETS.balanced;
+let presetKey: QualityPreset = QUALITY_PRESETS[state.quality] ? state.quality : 'balanced';
 
 // ------------------------------------------------------------------ logging
 
@@ -309,6 +310,8 @@ let pendingIncoming:
   | null = null;
 /** Requested viewport of the peer we are hosting for, if it told us. */
 let peerDisplay: SizeRequest | undefined;
+/** Quality the controller asked for in its connect request, if it said. */
+let peerQuality: string | undefined;
 /**
  * Viewport this device asks hosts to encode for. The renderer reports it, so a
  * browser window on a 1080p laptop asks for 1920x1080 even when the engine runs
@@ -323,6 +326,13 @@ let lastStatsLoggedAt = 0;
 let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
+/**
+ * True once the congestion controller has actually voted the link down
+ * this session. adaptedBitrateKbps alone cannot signal that: it is
+ * seeded with the slow-start value at every session start, so geometry
+ * keyed on it would shrink every healthy session's first seconds.
+ */
+let bitrateStarved = false;
 let lastBitrateAdaptAt = 0;
 /** Pending mid-session resize from the controller, debounced before the encoder restarts. */
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -640,7 +650,9 @@ function startEncoder(target: ActiveSession): void {
   // the primary the process happened to start with.
   const sel = target.role === 'host' ? (hostDisplays[target.displayIndex] ?? null) : null;
   const capture = sel ?? display;
-  const { width, height, scaled } = negotiateSize(capture, peerDisplay);
+  const negotiated = negotiateSize(capture, peerDisplay);
+  let { width, height } = negotiated;
+  let scaled = negotiated.scaled;
   const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
@@ -650,6 +662,25 @@ function startEncoder(target: ActiveSession): void {
   // pacer, which dropped frames, broke reference chains and forced an
   // encoder restart every second — the visible "卡得要死" death spiral.
   if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
+  // When the network (or the relay budget) has cut the bitrate far below
+  // what the negotiated pixels need, shrink the picture to fit the
+  // bitrate instead of starving every pixel into mosaic blocks. The
+  // smaller frame also serialises much faster on a thin uplink, which
+  // is where most of the input lag on a starved 4K stream comes from.
+  // Healthy paths never see this: it only engages once a measured
+  // bitrate (or the relay cap) is in force.
+  if (bitrateStarved || relayBudget) {
+    const capped = capSizeForBitrate({ width, height }, bitrateKbps, fps);
+    if (capped.width !== width || capped.height !== height) {
+      log(
+        'info',
+        `网络可用码率约 ${bitrateKbps} kbps，编码尺寸由 ${width}x${height} 降为 ${capped.width}x${capped.height} 以保证清晰度（带宽恢复后自动回升）`,
+      );
+      width = capped.width;
+      height = capped.height;
+      scaled = true;
+    }
+  }
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source:
@@ -855,6 +886,7 @@ async function onSignaling(msg: ServerToClient): Promise<void> {
       }
       pendingIncoming = { sessionId: msg.sessionId, from: msg.from, display: msg.display };
       peerDisplay = msg.display;
+      peerQuality = msg.display?.quality;
       // A code is always required, so the prompt always asks for one.
       sendUi({ type: 'incoming', sessionId: msg.sessionId, from: msg.from, passwordRequired: true });
       log('info', `收到连接请求 ${msg.from.name} (${msg.from.code})`);
@@ -1118,7 +1150,13 @@ async function startSession(
         ? `检测到 ${hostDisplays.length} 块屏幕：${hostDisplays.map(displayLabel).join(' · ')}，默认主屏`
         : `单屏 ${displayLabel(hostDisplays[0]!)}`,
     );
-    if (state.handOverDisplay) {
+    if (state.handOverDisplay && peerQuality === 'uhd') {
+      // 真4K means the panel must stay native: taking it over would
+      // switch a 3840x2160 panel down to the controller's viewport and
+      // the "4K" stream would be an upscale of a smaller desktop —
+      // exactly the soft picture the user is complaining about.
+      log('info', '主控请求真4K：保持本机原生分辨率，不切换面板');
+    } else if (state.handOverDisplay) {
       await takeOverPanel(negotiateSize(display, peerDisplay));
       // The takeover may have changed the primary's mode; re-read the sizes
       // so capture geometry and the screen picker describe reality.
@@ -1144,6 +1182,7 @@ async function startSession(
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
+  bitrateStarved = false;
   lastBitrateAdaptAt = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
@@ -1216,6 +1255,38 @@ async function startSession(
         }
         return;
       }
+      if (ctl.t === 'quality' && role === 'host' && active) {
+        // Session-scoped: the host owner's own saved default is left
+        // untouched; this only steers the running encoder (and the log
+        // says why the fps/bitrate suddenly changed).
+        const key = ctl.preset as QualityPreset;
+        const p = QUALITY_PRESETS[key];
+        if (p && key !== presetKey) {
+          presetKey = key;
+          preset = p;
+          active.session.setMaxBitrate(p.netKbps * 1000);
+          log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
+          if (key === 'uhd' && panelHold?.applied) {
+            // The panel was taken over (switched down) at session start,
+            // so the capture source itself is no longer 4K. Restore the
+            // native mode before encoding, or the 4K stream is just an
+            // upscale. Async: display switching takes a second or two.
+            log('info', '主控请求真4K：恢复本机原生分辨率后重新采集');
+            active.encoder?.stop();
+            void (async () => {
+              await releasePanel('（主控请求真4K）');
+              if (!active || active.role !== 'host') return;
+              hostDisplays = await listDisplays(preset.fps);
+              startEncoder(active);
+              sendDisplayList();
+            })();
+          } else {
+            active.encoder?.stop();
+            startEncoder(active);
+          }
+        }
+        return;
+      }
       if (ctl.t !== 'idr' || role !== 'host' || !active) return;
       const now = Date.now();
       // Restarting the encoder means a pipeline stall plus the largest
@@ -1267,6 +1338,8 @@ async function startSession(
       if (!drop && !recover) return;
       lastBitrateAdaptAt = now;
       adaptedBitrateKbps = kbps;
+      if (drop) bitrateStarved = true;
+      if (kbps >= preset.bitrateKbps * 0.6) bitrateStarved = false;
       log('info', `按网络状况调整编码码率至 ${kbps} kbps`);
       active.encoder.stop();
       startEncoder(active);
@@ -1329,6 +1402,11 @@ async function startSession(
     startDesktopMonitor();
   }
 
+  // The controller's quality choice drives the host's encoder; without
+  // this the host only ever used its own saved preset (default 30 fps).
+  if (role === 'controller') {
+    session.sendControl({ t: 'quality', preset: presetKey });
+  }
   sendUi({
     type: 'session-start',
     role,
@@ -1379,7 +1457,7 @@ function connectToPeer(codeRaw: string, password?: string): void {
     candidates: ourCandidates(),
     // This device is the controller, so the host should encode for *our* viewport
     // rather than its own screen; that is what makes a same-sized PC feel local.
-    display: { width: controllerSize.width, height: controllerSize.height, fps: preset.fps },
+    display: { width: controllerSize.width, height: controllerSize.height, fps: preset.fps, quality: presetKey },
   });
   sendUi({ type: 'session-state', state: 'waiting', role: 'controller', message: `正在请求 ${target}` });
   log('info', `请求连接 ${target}`);
@@ -1399,7 +1477,11 @@ function applyQuality(next: QualityPreset): void {
   state = { ...state, quality: next };
   saveState(state);
   preset = p;
+  presetKey = next;
   active?.session.setMaxBitrate(p.netKbps * 1000);
+  if (active?.role === 'controller') {
+    active.session.sendControl({ t: 'quality', preset: next });
+  }
   if (active?.role === 'host' && active.encoder) {
     active.encoder.stop();
     startEncoder(active);

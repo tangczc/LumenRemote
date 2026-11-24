@@ -23,7 +23,7 @@ export interface DeviceSummary {
 export type ClientToServer =
   | { t: 'hello'; deviceId?: string; preferredCode?: string; name: string; os: string; hostable?: boolean; token?: string }
   | { t: 'udp-token'; token: string; endpoint: EndpointInfo }
-  | { t: 'connect'; sessionId: string; targetCode: string; password?: string; eph: string; candidates: Candidate[]; display?: { width: number; height: number; fps: number } }
+  | { t: 'connect'; sessionId: string; targetCode: string; password?: string; eph: string; candidates: Candidate[]; display?: { width: number; height: number; fps: number; quality?: string } }
   | { t: 'accept'; sessionId: string; eph: string; candidates: Candidate[]; password?: string }
   | { t: 'reject'; sessionId: string; reason: string }
   | { t: 'candidates'; sessionId: string; candidates: Candidate[] }
@@ -32,7 +32,7 @@ export type ClientToServer =
 
 export type ServerToClient =
   | { t: 'welcome'; deviceId: string; code: string; udpPort: number; name: string }
-  | { t: 'incoming'; sessionId: string; from: DeviceSummary; passwordRequired: boolean; display?: { width: number; height: number; fps: number } }
+  | { t: 'incoming'; sessionId: string; from: DeviceSummary; passwordRequired: boolean; display?: { width: number; height: number; fps: number; quality?: string } }
   | {
       t: 'ready';
       sessionId: string;

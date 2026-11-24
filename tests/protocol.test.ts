@@ -234,6 +234,11 @@ describe('control messages', () => {
     assert.deepEqual(decodeControl(encodeControl(msg)), msg);
   });
 
+  test('quality control roundtrip (controller -> host preset key)', () => {
+    const msg = { t: 'quality' as const, preset: 'game' };
+    assert.deepEqual(decodeControl(encodeControl(msg)), msg);
+  });
+
   test('input roundtrip and garbage rejection', () => {
     const ev = { k: 'mm' as const, dx: 12, dy: -3 };
     assert.deepEqual(decodeInput(encodeInput(ev)), ev);

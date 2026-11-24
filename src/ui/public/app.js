@@ -210,6 +210,23 @@ function send(msg) {
 let lastClientDisplay = '';
 let clientDisplayTimer = 0;
 
+/**
+ * Every surface that names the route, painted from one place. The
+ * toolbar badge used to be the only one listening to route upgrades,
+ * so the host-mode mini window kept showing the route from session
+ * start (almost always 中继 — sessions start on the relay and upgrade
+ * seconds later) for the whole session.
+ */
+function paintRoute(route) {
+  const p2p = route === 'p2p';
+  for (const sel of ['#routeBadge', '#hostRoute']) {
+    const el = $(sel);
+    if (!el) continue;
+    el.textContent = p2p ? 'P2P 直连' : '中继转发';
+    el.classList.toggle('relay', !p2p);
+  }
+}
+
 /** The selected host display at its native size, when we know it. */
 function hostNativeSize() {
   const list = state.displays ?? [];
@@ -226,7 +243,11 @@ function reportClientDisplay() {
   // encoded at the fitted size (half its pixels) and then upscaled by the
   // browser — big and blurry. Native encode downscales in the browser,
   // which stays sharp, at the cost of bandwidth.
-  const native = state.viewMode !== 'fit' ? hostNativeSize() : null;
+  // 真4K (uhd) implies the same request on its own: "4K" that is fitted
+  // to a CSS-pixel stage on a scaled display never carries 4K content,
+  // which is precisely the soft picture users describe as 糊.
+  const wantNative = state.viewMode !== 'fit' || state.settings.quality === 'uhd';
+  const native = wantNative ? hostNativeSize() : null;
   if (native) {
     const width = Math.round(native.width / 2) * 2;
     const height = Math.round(native.height / 2) * 2;
@@ -345,10 +366,16 @@ function handleServer(msg) {
       renderDevice();
       break;
 
-    case 'settings':
+    case 'settings': {
+      const prevQuality = state.settings.quality;
       state.settings = msg.settings;
       renderSettings();
+      // A quality change can change the size we ask the host for (uhd
+      // requests the native resolution); re-report so it takes effect
+      // mid-session instead of on the next resize.
+      if (msg.settings.quality !== prevQuality) scheduleClientDisplay();
       break;
+    }
 
     case 'favorites':
       state.favorites = msg.favorites || [];
@@ -368,10 +395,8 @@ function handleServer(msg) {
       break;
 
     case 'session-route': {
-      const p2p = msg.route === 'p2p';
-      $('#routeBadge').textContent = p2p ? 'P2P 直连' : '中继转发';
-      $('#routeBadge').classList.toggle('relay', !p2p);
-      if (p2p) toast('已升级为 P2P 直连');
+      paintRoute(msg.route);
+      if (msg.route === 'p2p') toast('已升级为 P2P 直连');
       break;
     }
 
@@ -486,6 +511,8 @@ function renderSettings() {
   $('#handOverDisplay').checked = s.handOverDisplay !== false;
   $('#blackOutScreen').checked = s.blackOutScreen === true;
   for (const chip of $$('#qualityChips .chip')) chip.classList.toggle('active', chip.dataset.preset === s.quality);
+  const qualitySelect = $('#qualitySelect');
+  if (qualitySelect && qualitySelect.value !== s.quality) qualitySelect.value = s.quality;
 }
 
 function renderFavorites() {
@@ -596,8 +623,7 @@ function enterSession(msg) {
   $('#peerName').textContent = msg.peerName;
   $('#sasCode').textContent = `SAS ${msg.sas}`;
   const p2p = msg.route === 'p2p';
-  $('#routeBadge').textContent = p2p ? 'P2P 直连' : '中继转发';
-  $('#routeBadge').classList.toggle('relay', !p2p);
+  paintRoute(msg.route);
   $('#overlayText').textContent = msg.role === 'controller' ? '正在接收画面…' : '对方正在查看本机屏幕';
   $('#stageOverlay').hidden = msg.role !== 'controller';
   $('#btnConnect').disabled = false;
@@ -629,9 +655,7 @@ function enterHostMode(msg) {
   document.body.classList.remove('host-collapsed');
   $('#hostPeer').textContent = msg.peerName;
   $('#hostSas').textContent = `SAS ${msg.sas}`;
-  const p2p = msg.route === 'p2p';
-  $('#hostRoute').textContent = p2p ? 'P2P 直连' : '中继转发';
-  $('#hostRoute').classList.toggle('relay', !p2p);
+  paintRoute(msg.route);
   $('#hostFps').textContent = '—';
   $('#hostLatency').textContent = '—';
   $('#hostBitrate').textContent = '—';
@@ -1142,6 +1166,13 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#qualitySelect')?.addEventListener('change', (ev) => {
+    // Goes to our engine, which applies it locally and (as controller)
+    // forwards it to the host — the host is the one encoding.
+    send({ type: 'quality', preset: ev.target.value });
+    const label = ev.target.selectedOptions?.[0]?.textContent ?? ev.target.value;
+    toast(`画质已切换：${label}（被控将重启编码，画面会顿一下）`);
+  });
   $('#viewMode')?.addEventListener('change', (ev) => {
     applyViewMode(ev.target.value);
     if (ev.target.value === 'hd') toast('高清适应：按对方原始分辨率传输（更清晰，更耗带宽）');

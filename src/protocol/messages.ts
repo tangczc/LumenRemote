@@ -65,6 +65,14 @@ export type ControlMessage =
   /** Controller -> host: capture and control this display instead. */
   | { t: 'select-display'; index: number }
   /**
+   * Controller -> host: encode at this quality preset (key of
+   * QUALITY_PRESETS, validated by the receiver). Quality used to be a
+   * per-device local setting only, so a controller picking 游戏/4K
+   * changed nothing on the host, which kept encoding at its own
+   * saved (usually 30 fps) preset.
+   */
+  | { t: 'quality'; preset: string }
+  /**
    * Controller -> host: pointer-lock (relative mouse) engaged/released.
    * While locked the browser hides the local cursor, so the host bakes
    * its cursor into the video; without this the user has no pointer.
