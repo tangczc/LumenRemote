@@ -27,6 +27,11 @@ const state = {
   configuredKey: '',
   decodedFrames: 0,
   page: 'assist',
+  /** Host displays as last reported (drives the 原始大小 modes). */
+  displays: [],
+  activeDisplay: 0,
+  /** fit | hd | native — how the stage shows and sizes the stream. */
+  viewMode: 'fit',
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -205,9 +210,32 @@ function send(msg) {
 let lastClientDisplay = '';
 let clientDisplayTimer = 0;
 
+/** The selected host display at its native size, when we know it. */
+function hostNativeSize() {
+  const list = state.displays ?? [];
+  const current = list.find((d) => d.index === state.activeDisplay) ?? list[0];
+  if (!current || current.width <= 0 || current.height <= 0) return null;
+  return { width: current.width, height: current.height };
+}
+
 function reportClientDisplay() {
   const stage = $('#stage');
   if (!stage) return;
+  // 高清适应 / 原始大小 ask the host for its native resolution instead of
+  // the stage size. A portrait panel squeezed into a landscape stage was
+  // encoded at the fitted size (half its pixels) and then upscaled by the
+  // browser — big and blurry. Native encode downscales in the browser,
+  // which stays sharp, at the cost of bandwidth.
+  const native = state.viewMode !== 'fit' ? hostNativeSize() : null;
+  if (native) {
+    const width = Math.round(native.width / 2) * 2;
+    const height = Math.round(native.height / 2) * 2;
+    const key = `${state.viewMode}:${width}x${height}`;
+    if (key === lastClientDisplay) return;
+    lastClientDisplay = key;
+    send({ type: 'client-display', width, height });
+    return;
+  }
   const rect = stage.getBoundingClientRect();
   if (rect.width < 160 || rect.height < 120) return; // not laid out yet
   // Report CSS pixels, not device pixels. Multiplying by devicePixelRatio made
@@ -220,7 +248,7 @@ function reportClientDisplay() {
   // keeps a one-pixel wobble from re-negotiating the stream.
   const width = Math.round(rect.width / 2) * 2;
   const height = Math.round(rect.height / 2) * 2;
-  const key = `${width}x${height}`;
+  const key = `fit:${width}x${height}`;
   if (key === lastClientDisplay) return;
   lastClientDisplay = key;
   send({ type: 'client-display', width, height });
@@ -265,7 +293,13 @@ function syncFullscreenChrome() {
   document.body.classList.toggle('is-fullscreen', fs);
   const btn = $('#btnFullscreen');
   if (btn) btn.title = fs ? '退出全屏（F11 / Esc）' : '全屏（F11）';
-  $('.session-top')?.classList.remove('peek');
+  const topBar = $('.session-top');
+  topBar?.classList.remove('peek');
+  if (!fs && topBar) {
+    topBar.classList.remove('placed');
+    topBar.style.left = '';
+    topBar.style.top = '';
+  }
   if (toolbarPeekTimer) {
     clearTimeout(toolbarPeekTimer);
     toolbarPeekTimer = 0;
@@ -619,6 +653,9 @@ function leaveHostMode() {
  * mapping follows it, so the pointer can only ever land on that screen.
  */
 function renderDisplayPicker(displays, active) {
+  state.displays = displays;
+  state.activeDisplay = active;
+  scheduleClientDisplay();
   const select = $('#displaySelect');
   if (!select) return;
   if (state.session?.role === 'host') {
@@ -635,6 +672,15 @@ function renderDisplayPicker(displays, active) {
   }
   select.value = String(active);
   select.hidden = displays.length <= 1;
+}
+
+function applyViewMode(mode) {
+  state.viewMode = mode;
+  const stage = $('#stage');
+  if (stage) stage.classList.toggle('view-native', mode === 'native');
+  const select = $('#viewMode');
+  if (select && select.value !== mode) select.value = mode;
+  scheduleClientDisplay();
 }
 
 function exitSession(reason) {
@@ -1066,6 +1112,38 @@ function connectPeer(rawCode, password) {
 }
 
 function bindEvents() {
+  $('#viewMode')?.addEventListener('change', (ev) => {
+    applyViewMode(ev.target.value);
+    if (ev.target.value === 'hd') toast('高清适应：按对方原始分辨率传输（更清晰，更耗带宽）');
+    if (ev.target.value === 'native') toast('原始大小：1:1 显示，可滚动查看（按对方原始分辨率传输）');
+  });
+  // Drag the fullscreen toolbar by its empty areas (buttons and selects
+  // keep working normally). Once placed it stays where it was dropped
+  // until fullscreen exits.
+  const topBar = $('.session-top');
+  if (topBar) {
+    let drag = null;
+    topBar.addEventListener('pointerdown', (ev) => {
+      if (!document.fullscreenElement) return;
+      if (ev.target.closest('button, select, input, textarea, a')) return;
+      const rect = topBar.getBoundingClientRect();
+      drag = { dx: ev.clientX - rect.left, dy: ev.clientY - rect.top, width: rect.width, height: rect.height };
+      topBar.setPointerCapture?.(ev.pointerId);
+    });
+    topBar.addEventListener('pointermove', (ev) => {
+      if (!drag) return;
+      const x = Math.min(Math.max(0, ev.clientX - drag.dx), Math.max(0, window.innerWidth - drag.width));
+      const y = Math.min(Math.max(0, ev.clientY - drag.dy), Math.max(0, window.innerHeight - drag.height));
+      topBar.classList.add('placed');
+      topBar.style.left = `${x}px`;
+      topBar.style.top = `${y}px`;
+    });
+    const endDrag = () => {
+      drag = null;
+    };
+    topBar.addEventListener('pointerup', endDrag);
+    topBar.addEventListener('pointercancel', endDrag);
+  }
   $('#displaySelect')?.addEventListener('change', (ev) => {
     const index = Number(ev.target.value);
     if (Number.isFinite(index)) {
