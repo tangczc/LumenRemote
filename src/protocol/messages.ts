@@ -64,6 +64,12 @@ export type ControlMessage =
   | { t: 'displays'; displays: DisplayDescriptor[]; active: number }
   /** Controller -> host: capture and control this display instead. */
   | { t: 'select-display'; index: number }
+  /**
+   * Controller -> host: pointer-lock (relative mouse) engaged/released.
+   * While locked the browser hides the local cursor, so the host bakes
+   * its cursor into the video; without this the user has no pointer.
+   */
+  | { t: 'pointer-lock'; locked: boolean }
   | { t: 'clipboard'; format: 'text' | 'html'; data: string }
   | { t: 'cursor'; visible: boolean; x: number; y: number }
   | { t: 'bye'; reason: string }

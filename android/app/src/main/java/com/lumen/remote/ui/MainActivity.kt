@@ -775,6 +775,10 @@ class MainActivity : android.app.Activity(), SurfaceHolder.Callback {
             return
         }
         mouseCaptured = enabled
+        // Pointer capture hides any local pointer here too, so the host
+        // bakes its cursor into the video while this mode is on —
+        // otherwise relative mode has no visible cursor at all.
+        client.setPointerLock(enabled)
         if (enabled) surfaceView.requestPointerCapture() else surfaceView.releasePointerCapture()
         captureButton.text = if (enabled) "鼠标锁定 ●" else "鼠标锁定"
     }

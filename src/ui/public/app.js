@@ -914,16 +914,10 @@ function setupStageInput() {
     ev.preventDefault();
   });
 
-  canvas.addEventListener('dblclick', (ev) => {
-    ev.preventDefault();
-    if (document.pointerLockElement === stage) {
-      document.exitPointerLock();
-    } else {
-      // Chrome returns a promise here and rejects when the gesture is not trusted,
-      // which would otherwise surface as an unhandled rejection.
-      Promise.resolve(stage.requestPointerLock?.()).catch(() => undefined);
-    }
-  });
+  // No pointer-lock toggle on double-click: double-clicking is how icons
+  // and folders open, and engaging pointer lock there hid the cursor
+  // (browser hides it; the video has no baked cursor) with no hint why.
+  // The toolbar's mouse-lock button owns that mode now.
 
   // Mouseup must be heard even when the pointer left the canvas mid-drag,
   // otherwise the host button stays pressed.
@@ -972,7 +966,14 @@ function setupStageInput() {
 
   document.addEventListener('pointerlockchange', () => {
     const locked = document.pointerLockElement === stage;
-    $('#captureHint').textContent = locked ? '已捕获键鼠 · 按 Esc 释放' : '双击画面捕获键鼠（游戏用）';
+    $('#captureHint').textContent = locked
+      ? '鼠标已锁定 · 以画面中的光标为准 · 按 Esc 释放'
+      : '工具栏「鼠标锁定」可切换游戏相对模式';
+    $('#btnPointerLock')?.classList.toggle('active', locked);
+    // The browser hides the local cursor while locked, so the host bakes
+    // its real cursor into the video for the duration. Without this the
+    // pointer simply vanishes — the original complaint.
+    send({ type: 'pointer-lock', locked });
   });
 }
 
@@ -1171,6 +1172,16 @@ function bindEvents() {
     toast('已请求关键帧');
   });
   $('#btnFullscreen').addEventListener('click', toggleFullscreen);
+  $('#btnPointerLock')?.addEventListener('click', () => {
+    const stage = $('#stage');
+    if (document.pointerLockElement === stage) {
+      document.exitPointerLock();
+    } else if (stage) {
+      // Chrome returns a promise here and rejects when the gesture is not
+      // trusted, which would otherwise surface as an unhandled rejection.
+      Promise.resolve(stage.requestPointerLock?.()).catch(() => undefined);
+    }
+  });
   $('#sessionLayer')?.addEventListener('mousemove', pokeToolbar);
   // Capture phase, so F11 is claimed locally before the stage's input
   // forwarding can also ship it to the remote machine: one press must not

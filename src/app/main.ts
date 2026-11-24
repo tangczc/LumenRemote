@@ -330,6 +330,11 @@ let resizeTimer: ReturnType<typeof setTimeout> | null = null;
  * media has to cross two WAN legs plus a shared server.
  */
 let relayBudget = false;
+/**
+ * Bake the host cursor into the video. Only while the controller is in
+ * pointer-lock mode, where its own cursor is hidden by the browser.
+ */
+let bakeCursor = false;
 /** Encoder crashes absorbed in the current session, so a broken capture cannot loop. */
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
@@ -599,6 +604,7 @@ function startEncoder(target: ActiveSession): void {
             mode: 'auto',
             outputIndex: sel?.index,
             rect: sel ? { x: sel.x, y: sel.y, width: sel.width, height: sel.height } : undefined,
+            drawMouse: bakeCursor,
           },
     fps,
     bitrateKbps,
@@ -1044,6 +1050,7 @@ async function startSession(
     password: msg.password,
   });
   autoRestarts = 0;
+  bakeCursor = false;
   // Seed the encoder at the slow-start rate too: an encoder producing the
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
@@ -1076,6 +1083,15 @@ async function startSession(
       }
       if (ctl.t === 'select-display' && role === 'host') {
         void switchDisplay(Math.round(ctl.index));
+        return;
+      }
+      if (ctl.t === 'pointer-lock' && role === 'host' && active) {
+        if (ctl.locked !== bakeCursor) {
+          bakeCursor = ctl.locked;
+          log('info', bakeCursor ? '主控进入鼠标锁定：已将本机光标烘焙进画面' : '主控退出鼠标锁定：恢复本地光标');
+          active.encoder?.stop();
+          startEncoder(active);
+        }
         return;
       }
       if (ctl.t === 'resize' && role === 'host' && active) {
@@ -1347,6 +1363,11 @@ function handleUi(msg: UiToApp): void {
     case 'select-display':
       if (active?.role === 'controller') {
         active.session.sendControl({ t: 'select-display', index: Math.round(msg.index) });
+      }
+      break;
+    case 'pointer-lock':
+      if (active?.role === 'controller') {
+        active.session.sendControl({ t: 'pointer-lock', locked: msg.locked });
       }
       break;
     case 'client-display':

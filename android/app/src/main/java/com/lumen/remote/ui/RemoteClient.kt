@@ -320,6 +320,10 @@ class RemoteClient(
         session?.selectDisplay(index)
     }
 
+    fun setPointerLock(locked: Boolean) {
+        session?.pointerLock(locked)
+    }
+
     fun disconnect() {
           val s = session
           // The notification has to be queued before the teardown below: the old

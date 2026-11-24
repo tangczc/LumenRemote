@@ -57,6 +57,7 @@ export type UiToApp =
   | { type: 'fav-add'; code: string; name?: string }
   | { type: 'export-logs'; clientLog?: string }
   | { type: 'select-display'; index: number }
+  | { type: 'pointer-lock'; locked: boolean }
   | { type: 'fav-remove'; code: string };
 
 export interface AppSettingsDto {
