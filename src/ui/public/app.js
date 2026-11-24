@@ -235,6 +235,56 @@ function scheduleClientDisplay() {
 }
 
 window.addEventListener('resize', scheduleClientDisplay);
+
+/* ---------------------------------------------------------------- fullscreen */
+
+/**
+ * Session fullscreen, F11-style. One code path for the toolbar button, the
+ * F11 key and the desktop shell (whose default menu used to swallow F11
+ * and toggle the *window*, leaving this page's fullscreen CSS and the
+ * hidden toolbar out of sync). Esc exits natively in browsers; the
+ * desktop shell gets an explicit handler below.
+ */
+function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen?.()?.catch?.(() => {});
+    } else {
+      const p = $('#sessionLayer')?.requestFullscreen?.({ navigationUI: 'hide' });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
+  } catch {
+    /* fullscreen needs a user gesture; the click/keypress is one, but a
+       programmatic re-entry after session start is not — ignore. */
+  }
+}
+
+let toolbarPeekTimer = 0;
+function syncFullscreenChrome() {
+  const fs = Boolean(document.fullscreenElement);
+  document.body.classList.toggle('is-fullscreen', fs);
+  const btn = $('#btnFullscreen');
+  if (btn) btn.title = fs ? '退出全屏（F11 / Esc）' : '全屏（F11）';
+  $('.session-top')?.classList.remove('peek');
+  if (toolbarPeekTimer) {
+    clearTimeout(toolbarPeekTimer);
+    toolbarPeekTimer = 0;
+  }
+  if (fs) $('#stage')?.focus();
+}
+document.addEventListener('fullscreenchange', syncFullscreenChrome);
+
+/** In fullscreen the toolbar hides; brushing the top edge brings it back. */
+function pokeToolbar(ev) {
+  if (!document.fullscreenElement) return;
+  const top = $('.session-top');
+  if (!top) return;
+  const nearTop = ev.clientY <= 44 || ev.target instanceof Node && top.contains(ev.target);
+  if (!nearTop) return;
+  top.classList.add('peek');
+  if (toolbarPeekTimer) clearTimeout(toolbarPeekTimer);
+  toolbarPeekTimer = setTimeout(() => top.classList.remove('peek'), 2400);
+}
 window.addEventListener('orientationchange', scheduleClientDisplay);
 document.addEventListener('fullscreenchange', scheduleClientDisplay);
 if (typeof ResizeObserver !== 'undefined') {
@@ -516,6 +566,10 @@ function enterSession(msg) {
     enterHostMode(msg);
   }
   logLine('info', `会话建立 ${msg.role === 'host' ? '被控' : '主控'} · ${msg.peerName} · ${p2p ? 'P2P' : '中继'}`);
+  if (msg.role === 'controller' && !state.fsHintShown) {
+    state.fsHintShown = true;
+    toast('按 F11 进入全屏（全屏时鼠标移到顶部可调出工具栏）');
+  }
   toast(`已连接 ${msg.peerName}`);
 }
 
@@ -572,6 +626,7 @@ function renderDisplayPicker(displays, active) {
 
 function exitSession(reason) {
   state.session = null;
+  if (document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => {});
   const select = $('#displaySelect');
   if (select) {
     select.hidden = true;
@@ -1115,10 +1170,27 @@ function bindEvents() {
     send({ type: 'keyframe' });
     toast('已请求关键帧');
   });
-  $('#btnFullscreen').addEventListener('click', () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else $('#sessionLayer').requestFullscreen?.();
-  });
+  $('#btnFullscreen').addEventListener('click', toggleFullscreen);
+  $('#sessionLayer')?.addEventListener('mousemove', pokeToolbar);
+  // Capture phase, so F11 is claimed locally before the stage's input
+  // forwarding can also ship it to the remote machine: one press must not
+  // both toggle this window's fullscreen and press F11 over there.
+  document.addEventListener('keydown', (ev) => {
+    if ($('#sessionLayer')?.hidden) return;
+    if (ev.key === 'F11') {
+      // The F11-style experience this app promises: our fullscreen, not
+      // whichever window/browser variant the host OS had in mind.
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleFullscreen();
+    } else if (ev.key === 'Escape' && document.fullscreenElement && window.lumen) {
+      // Desktop shell: Esc does not reliably exit element fullscreen
+      // there, so do it explicitly. Browsers handle Esc natively and
+      // mostly do not deliver this keydown at all.
+      ev.preventDefault();
+      void document.exitFullscreen?.();
+    }
+  }, true);
 
   for (const chip of $$('#qualityChips .chip')) {
     chip.addEventListener('click', () => send({ type: 'quality', preset: chip.dataset.preset }));

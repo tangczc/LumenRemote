@@ -1011,12 +1011,27 @@ body {
   cursor: default;
 }
 
-/* True fullscreen: hide the session chrome so the stage IS the screen. */
+/* True fullscreen: hide the session chrome so the stage IS the screen.
+   The toolbar turns into a floating bar that peeks in when the pointer
+   touches the top edge — hangup, keyframe and the screen picker must stay
+   reachable without leaving fullscreen first. */
 .session:fullscreen {
   grid-template-rows: minmax(0, 1fr);
 }
 .session:fullscreen .session-top {
-  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: linear-gradient(180deg, rgba(5, 7, 11, 0.94), rgba(5, 7, 11, 0.78));
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  transform: translateY(-106%);
+  transition: transform 0.18s var(--ease);
+}
+.session:fullscreen .session-top.peek {
+  transform: none;
 }
 
 .stage-overlay {
