@@ -47,6 +47,7 @@ export type UiToApp =
   | { type: 'disconnect' }
   | { type: 'quality'; preset: QualityPreset }
   | { type: 'keyframe' }
+  | { type: 'probe' }
   | { type: 'client-display'; width: number; height: number; fps?: number }
   | { type: 'input'; event: unknown }
   | { type: 'set-allow'; enabled: boolean }

@@ -1397,6 +1397,12 @@ function bindEvents() {
     $('#btnHostExpand').hidden = true;
     window.lumen?.setHostPanel?.('expanded');
   });
+  $('#btnProbe').addEventListener('click', () => {
+    send({ type: 'probe' });
+    logLine('info', '已请求链路测速：被控将以固定 45 Mbps 发送 15 秒测试图（期间画面为测试图案）');
+    toast('链路测速中（15 秒）…');
+  });
+
   $('#btnKeyframe').addEventListener('click', () => {
     send({ type: 'keyframe' });
     toast('已请求关键帧');
