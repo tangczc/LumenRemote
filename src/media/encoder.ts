@@ -214,10 +214,16 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
     h264_nvenc: [
       '-c:v',
       'h264_nvenc',
+      // p1 (fastest) at a starved bitrate smears text into mush; p4 is
+      // still fixed-function hardware speed at desktop resolutions and
+      // spends the same bits far better. Spatial AQ steers bits toward
+      // detailed regions (glyphs, edges) instead of flat backgrounds.
       '-preset',
-      'p1',
+      'p4',
       '-tune',
       'ull',
+      '-spatial-aq',
+      '1',
       '-rc',
       'cbr',
       '-zerolatency',

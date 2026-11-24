@@ -19,7 +19,7 @@ import type { InputEvent } from '../protocol/messages.ts';
 import { splitAnnexB } from '../media/nal.ts';
 import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
-import { capSizeForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
+import { fitGeometryForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
 import {
@@ -653,7 +653,7 @@ function startEncoder(target: ActiveSession): void {
   const negotiated = negotiateSize(capture, peerDisplay);
   let { width, height } = negotiated;
   let scaled = negotiated.scaled;
-  const fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
+  let fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
   const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
@@ -670,14 +670,15 @@ function startEncoder(target: ActiveSession): void {
   // Healthy paths never see this: it only engages once a measured
   // bitrate (or the relay cap) is in force.
   if (bitrateStarved || relayBudget) {
-    const capped = capSizeForBitrate({ width, height }, bitrateKbps, fps);
-    if (capped.width !== width || capped.height !== height) {
+    const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
+    if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
       log(
         'info',
-        `网络可用码率约 ${bitrateKbps} kbps，编码尺寸由 ${width}x${height} 降为 ${capped.width}x${capped.height} 以保证清晰度（带宽恢复后自动回升）`,
+        `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
       );
-      width = capped.width;
-      height = capped.height;
+      width = fit.width;
+      height = fit.height;
+      fps = fit.fps;
       scaled = true;
     }
   }

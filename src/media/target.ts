@@ -80,6 +80,30 @@ export function capSizeForBitrate(size: Size, kbps: number, fps: number, minBpp 
   };
 }
 
+/**
+ * Pick encode geometry for a bitrate the network actually sustains.
+ *
+ * Pixels first, frames second: when the pixel budget at the requested
+ * fps would crush the picture below half its size, halving the frame
+ * rate doubles the bits per frame and buys back most of the pixels.
+ * For desktop content (text!) a clear 30 fps beats a 60 fps smear at
+ * the same bitrate every time; motion-heavy content on a healthy link
+ * never reaches this code path.
+ */
+export function fitGeometryForBitrate(
+  size: Size,
+  kbps: number,
+  fps: number,
+): { width: number; height: number; fps: number } {
+  const capped = capSizeForBitrate(size, kbps, fps);
+  const crushed = capped.width * capped.height < size.width * size.height * 0.5;
+  if (crushed && fps > 30) {
+    const at30 = capSizeForBitrate(size, kbps, 30);
+    return { width: at30.width, height: at30.height, fps: 30 };
+  }
+  return { width: capped.width, height: capped.height, fps };
+}
+
 export function scaleBitrate(baseKbps: number, host: Size, target: Size, minRatio = 0.4): number {
   const hostPixels = Math.max(1, host.width * host.height);
   const targetPixels = Math.max(1, target.width * target.height);
