@@ -49,3 +49,6 @@ desktop.ini
 android/ua.xml
 android/ub.xml
 android/*.png
+
+# 临时文件
+*.tmp

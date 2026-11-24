@@ -127,9 +127,12 @@ export class AppLogger {
       appendFileSync(this.filePath, `${line}\n`, 'utf8');
       this.size += line.length + 1;
     } catch {
-      // A read-only disk or a deleted directory must not crash the app;
-      // the in-memory ring still backs the export feature.
-      this.broken = true;
+      if (!this.broken) {
+        this.broken = true;
+        // 盘满、只读目录、目录被删都只降级，不中断会话；但文件日志到此为止，
+        // 必须让人知道（内存 ring 仍可用于导出）。
+        console.warn(`[logger] 无法写入 ${this.filePath}，文件日志已停用（仅控制台 + 内存）`);
+      }
     }
   }
 
