@@ -334,6 +334,10 @@ let adaptedBitrateKbps = 0;
  */
 let bitrateStarved = false;
 let lastBitrateAdaptAt = 0;
+/** Since when the congestion verdict has continuously justified a recovery. */
+let pendingRecoverAt = 0;
+/** Last congestion verdict seen (bps), re-run by the stats heartbeat. */
+let lastVerdictBps = 0;
 /** Pending mid-session resize from the controller, debounced before the encoder restarts. */
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 /**
@@ -1185,10 +1189,78 @@ async function startSession(
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
   bitrateStarved = false;
   lastBitrateAdaptAt = 0;
+  pendingRecoverAt = 0;
+  lastVerdictBps = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
     resizeTimer = null;
   }
+
+  // Feed the congestion verdict back into the encoder (debounced, and
+  // only on a material change): pacing alone cannot fix an encoder that
+  // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
+  // No encoder yet (path still probing) is not a reason to drop the
+  // verdict: record it, and startEncoder picks it up when it starts.
+  const applyVerdict = (bps: number): void => {
+    if (!active || active.role !== 'host') return;
+    const now = Date.now();
+    const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
+    // Judge the verdict against what the encoder can actually run at:
+    // the preset (or relay) cap. The wire verdict swings far above it
+    // on a probing link (4.6M -> 18.6M -> 4.6M ...), and comparing /
+    // storing it raw restarted the encoder at the *same* capped rate
+    // over and over — 16 no-op restarts in one 8-minute session, each
+    // costing a stall plus a keyframe burst into a thin uplink.
+    const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+    const capped = Math.min(kbps, capKbps);
+    const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
+    // Wide hysteresis: restarting the encoder costs a pipeline stall
+    // plus a keyframe burst, so on a healthy-but-variable link the cure
+    // was worse than the disease — a visible freeze every few seconds.
+    // Only a deep, sustained mismatch (40%+) justifies the restart;
+    // the pacer absorbs anything smaller by dropping frames.
+    const drop = capped < current * 0.6;
+    const recover = adaptedBitrateKbps > 0 && capped > current * 1.5;
+    if (!drop && !recover) {
+      pendingRecoverAt = 0;
+      return;
+    }
+    // A recovery must be sustained, not a probe spike: the congestion
+    // target regularly leaps to the ceiling for a second or two while
+    // probing, then crashes back. Acting on the spike restarted the
+    // encoder (and rebuilt the peer's decoder at a new size) five
+    // times in half a minute — the visible stall right after the
+    // user asked for 4K. Drops stay immediate: protecting the link
+    // cannot wait, climbing back can.
+    if (recover && !drop) {
+      if (pendingRecoverAt === 0) {
+        pendingRecoverAt = now;
+        return;
+      }
+      if (now - pendingRecoverAt < 3000) return;
+    }
+    pendingRecoverAt = 0;
+    // Recoveries may land every 3 s: the old flat 8 s cadence meant a
+    // 4K stream spent its first half-minute climbing 2.4M -> 45M in
+    // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
+    // Drops keep the calm 8 s cadence — that direction is the one
+    // that thrashes on a variable link.
+    if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
+    lastBitrateAdaptAt = now;
+    // Recover in steps, not in one leap to the (probing) verdict: a
+    // 1.5x step that the link cannot hold is absorbed by the pacer
+    // inside the hysteresis band instead of crashing straight back
+    // down and restarting the encoder again.
+    adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
+    if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
+    if (drop) bitrateStarved = true;
+    if (capped >= capKbps * 0.6) bitrateStarved = false;
+    log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
+    if (active.encoder) {
+      active.encoder.stop();
+      startEncoder(active);
+    }
+  };
 
   const session = new Session({
     role,
@@ -1312,6 +1384,13 @@ async function startSession(
     },
     onStats: (s) => {
       sendUi({ type: 'stats', stats: toDto(s) });
+      // If a recovery has been continuously justified for 3 s but the
+      // verdict stopped moving (pinned at the ceiling), no further
+      // onBitrateChange arrives to execute it — re-run the last verdict
+      // from this heartbeat instead.
+      if (pendingRecoverAt > 0 && lastVerdictBps > 0 && Date.now() - pendingRecoverAt >= 3000) {
+        applyVerdict(lastVerdictBps);
+      }
       // A 10 s stats heartbeat in the log file is what makes "it stuttered
       // around 21:40" answerable after the fact: the live UI numbers are
       // gone the moment the session ends, the file keeps the whole curve.
@@ -1330,51 +1409,8 @@ async function startSession(
     },
     onBitrateChange: (bps) => {
       log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`);
-      // Feed the congestion verdict back into the encoder (debounced, and
-      // only on a material change): pacing alone cannot fix an encoder that
-      // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
-      // No encoder yet (path still probing) is not a reason to drop the
-      // verdict: record it, and startEncoder picks it up when it starts.
-      if (!active || active.role !== 'host') return;
-      const now = Date.now();
-      const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
-      // Judge the verdict against what the encoder can actually run at:
-      // the preset (or relay) cap. The wire verdict swings far above it
-      // on a probing link (4.6M -> 18.6M -> 4.6M ...), and comparing /
-      // storing it raw restarted the encoder at the *same* capped rate
-      // over and over — 16 no-op restarts in one 8-minute session, each
-      // costing a stall plus a keyframe burst into a thin uplink.
-      const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
-      const capped = Math.min(kbps, capKbps);
-      const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
-      // Wide hysteresis: restarting the encoder costs a pipeline stall
-      // plus a keyframe burst, so on a healthy-but-variable link the cure
-      // was worse than the disease — a visible freeze every few seconds.
-      // Only a deep, sustained mismatch (40%+) justifies the restart;
-      // the pacer absorbs anything smaller by dropping frames.
-      const drop = capped < current * 0.6;
-      const recover = adaptedBitrateKbps > 0 && capped > current * 1.5;
-      if (!drop && !recover) return;
-      // Recoveries may land every 3 s: the old flat 8 s cadence meant a
-      // 4K stream spent its first half-minute climbing 2.4M -> 45M in
-      // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
-      // Drops keep the calm 8 s cadence — that direction is the one
-      // that thrashes on a variable link.
-      if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
-      lastBitrateAdaptAt = now;
-      // Recover in steps, not in one leap to the (probing) verdict: a
-      // 1.5x step that the link cannot hold is absorbed by the pacer
-      // inside the hysteresis band instead of crashing straight back
-      // down and restarting the encoder again.
-      adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
-      if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
-      if (drop) bitrateStarved = true;
-      if (capped >= capKbps * 0.6) bitrateStarved = false;
-      log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
-      if (active.encoder) {
-        active.encoder.stop();
-        startEncoder(active);
-      }
+      lastVerdictBps = bps;
+      applyVerdict(bps);
     },
   });
   session.start();
