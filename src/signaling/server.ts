@@ -299,10 +299,26 @@ export class SignalingServer {
     // as a server-reflexive candidate; a device behind NAT does not know it.
     device.reflexive = endpoint;
     for (const s of this.sessions.values()) {
-      if (s.hostDevice === device.deviceId && !s.hostEndpoint) {
+      // Re-registration must be able to MOVE an endpoint, not just fill an
+      // empty one: clients re-discover periodically and whenever the path
+      // looks dead, and on a mobile network the observed endpoint changes
+      // (new NAT mapping, cell handover). Pinning the first endpoint ever
+      // seen made the relay forward to a dead address for the rest of the
+      // session — the fallback path failed exactly when it was needed.
+      const stale =
+        s.hostDevice === device.deviceId
+          ? s.hostEndpoint
+          : s.ctrlDevice === device.deviceId
+            ? s.ctrlEndpoint
+            : undefined;
+      if (stale && (stale.address !== endpoint.address || stale.port !== endpoint.port)) {
+        const oldKey = endpointKey(stale);
+        if (this.relayIndex.get(oldKey) === s.sessionId) this.relayIndex.delete(oldKey);
+      }
+      if (s.hostDevice === device.deviceId && (!s.hostEndpoint || stale)) {
         s.hostEndpoint = endpoint;
         s.hostUdpToken = token;
-      } else if (s.ctrlDevice === device.deviceId && !s.ctrlEndpoint) {
+      } else if (s.ctrlDevice === device.deviceId && (!s.ctrlEndpoint || stale)) {
         s.ctrlEndpoint = endpoint;
         s.ctrlUdpToken = token;
       }

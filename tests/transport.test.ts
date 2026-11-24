@@ -3,7 +3,7 @@ import { test, describe } from 'node:test';
 import dgram from 'node:dgram';
 import { CongestionController, DelayGradientEstimator, JitterEstimator } from '../src/transport/congestion.ts';
 import { Pacer } from '../src/transport/pacer.ts';
-import { SimulatedLink, PERFECT_LINK, UdpLink, type SimConfig } from '../src/transport/link.ts';
+import { SimulatedLink, PERFECT_LINK, UdpLink, type Endpoint, type Link, type SimConfig } from '../src/transport/link.ts';
 import { Session, type IncomingFrame } from '../src/transport/session.ts';
 import { deriveSessionKeys, generateEphemeral } from '../src/protocol/crypto.ts';
 import { Channel, Codec, PacketFlags } from '../src/protocol/constants.ts';
@@ -67,6 +67,37 @@ describe('estimators', () => {
       g.add(arrival, send);
     }
     assert.ok(g.take() > 1_000);
+  });
+
+  test('delay gradient reports total growth, not the per-packet mean', () => {
+    // Regression: take() used to divide by the sample count, so the value
+    // reaching the congestion controller was ~1000x smaller than its
+    // thresholds and the delay signal could never fire under bufferbloat.
+    const g = new DelayGradientEstimator();
+    let arrival = 0;
+    let send = 0;
+    g.add(0, 0);
+    for (let i = 0; i < 10; i++) {
+      arrival += 12_000;
+      send += 10_000;
+      g.add(arrival, send);
+    }
+    // 9 intervals of +2000 µs drift each: the total is ~18 ms, the mean 2 ms.
+    assert.ok(g.take() >= 15_000, `expected accumulated drift, got mean-scale value`);
+  });
+
+  test('congestion controller backs off on mild but persistent queue growth', () => {
+    // +3 ms of queue growth per report interval never crosses the overuse
+    // threshold, yet the queue grows without bound; the controller must
+    // still shed rate instead of increasing forever.
+    let now = 0;
+    const cc = new CongestionController({ initialBps: 10_000_000, minBps: 500_000, maxBps: 20_000_000, nowMs: () => now });
+    const start = cc.targetBps;
+    for (let i = 0; i < 60; i++) {
+      now += 20;
+      cc.onSample({ lossRate: 0, delayGradientUs: 3_000, rttUs: 40_000 });
+    }
+    assert.ok(cc.targetBps < start, `expected decrease, got ${cc.targetBps} vs ${start}`);
   });
 
   test('jitter tracks arrival variance', () => {
@@ -293,6 +324,178 @@ describe('session over simulated link', () => {
       s.controller.close();
       s.simA.close();
       s.simB.close();
+    }
+  });
+
+  test('congestion control backs off when the path queues instead of dropping', async () => {
+    // A link that QUEUES like a home router (deep buffer, ~0% loss) rather
+    // than dropping: the old per-packet-mean gradient could not see this
+    // at all, the sender stayed at full rate, and latency grew unbounded.
+    class QueueingLink implements Link {
+      readonly kind = 'queue-test';
+      private handlers: ((data: Buffer, from?: { address: string; port: number }) => void)[] = [];
+      private peer: QueueingLink | null = null;
+      private pending: { due: number; payload: Buffer }[] = [];
+      private tailDue = 0;
+      private pumping = false;
+      private closedFlag = false;
+      constructor(private readonly rateBps: number) {}
+      static pair(rateBps: number): { a: QueueingLink; b: QueueingLink } {
+        const a = new QueueingLink(rateBps);
+        const b = new QueueingLink(rateBps);
+        a.peer = b;
+        b.peer = a;
+        return { a, b };
+      }
+      onMessage(cb: (data: Buffer, from?: { address: string; port: number }) => void): void {
+        this.handlers.push(cb);
+      }
+      send(packet: Buffer): void {
+        if (this.closedFlag || !this.peer) return;
+        const now = performance.now();
+        const start = Math.max(now, this.tailDue);
+        const due = start + (packet.length * 8 * 1000) / this.rateBps;
+        this.tailDue = due;
+        this.pending.push({ due, payload: Buffer.from(packet) });
+        this.schedule();
+      }
+      private schedule(): void {
+        if (this.pumping || this.closedFlag) return;
+        this.pumping = true;
+        setImmediate(() => {
+          this.pumping = false;
+          const now = performance.now();
+          const ready = this.pending.filter((p) => p.due <= now);
+          this.pending = this.pending.filter((p) => p.due > now);
+          for (const p of ready) for (const h of this.peer!.handlers) h(p.payload);
+          if (this.pending.length > 0) this.schedule();
+        });
+      }
+      close(): void {
+        this.closedFlag = true;
+        this.pending = [];
+      }
+    }
+
+    const { a, b } = QueueingLink.pair(4_000_000);
+    const hostEph = generateEphemeral();
+    const ctrlEph = generateEphemeral();
+    const sessionId = 'queue-session';
+    const received: IncomingFrame[] = [];
+    const host = new Session({
+      role: 'host',
+      link: a,
+      keys: deriveSessionKeys({ sessionId, localEphemeral: hostEph, peerPublicRaw: ctrlEph.publicKeyRaw, role: 'host' }),
+      sessionId,
+      initialBitrateBps: 12_000_000,
+      maxBitrateBps: 12_000_000,
+    });
+    const controller = new Session({
+      role: 'controller',
+      link: b,
+      keys: deriveSessionKeys({ sessionId, localEphemeral: ctrlEph, peerPublicRaw: hostEph.publicKeyRaw, role: 'controller' }),
+      sessionId,
+      initialBitrateBps: 12_000_000,
+      maxBitrateBps: 12_000_000,
+      onFrame: (f) => received.push(f),
+    });
+    host.start();
+    controller.start();
+    try {
+      const startedAt = Date.now();
+      // ~8 Mbps of frames into a 4 Mbps queueing path for ~2.5 s.
+      while (Date.now() - startedAt < 2500) {
+        host.sendFrame(Codec.H264, 0, Buffer.alloc(40 * 1024, 7));
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.ok(received.length > 0, 'no frames delivered over the queueing path');
+      assert.ok(
+        host.stats.targetBps < 8_000_000,
+        `expected congestion backoff below 8 Mbps, target still ${host.stats.targetBps}`,
+      );
+    } finally {
+      host.close();
+      controller.close();
+      a.close();
+      b.close();
+    }
+  });
+
+  test('session follows an authenticated peer to its new endpoint (path migration)', async () => {
+    // A link whose apparent source address can change mid-session, the way
+    // a mobile peer's NAT mapping does. Before migration support, the
+    // receiver kept replying to the dead address until the session timed
+    // out — the classic "移动网络动不动就断".
+    class ManualLink implements Link {
+      readonly kind = 'manual';
+      private handlers: ((data: Buffer, from?: Endpoint) => void)[] = [];
+      peer: ManualLink | null = null;
+      source: Endpoint = { address: '10.0.0.1', port: 5000 };
+      remote: Endpoint | null = null;
+      get remoteEndpoint(): Endpoint | null {
+        return this.remote;
+      }
+      setRemote(ep: Endpoint | null): void {
+        this.remote = ep;
+      }
+      send(packet: Buffer): void {
+        this.peer?.deliver(Buffer.from(packet), this.source);
+      }
+      deliver(data: Buffer, from: Endpoint): void {
+        for (const h of this.handlers) h(data, from);
+      }
+      onMessage(cb: (data: Buffer, from?: Endpoint) => void): void {
+        this.handlers.push(cb);
+      }
+      close(): void {}
+    }
+
+    const a = new ManualLink();
+    const b = new ManualLink();
+    a.peer = b;
+    b.peer = a;
+    a.source = { address: '10.0.0.1', port: 5000 };
+    b.source = { address: '10.0.0.2', port: 5000 };
+    a.setRemote(b.source);
+    b.setRemote(a.source);
+
+    const hostEph = generateEphemeral();
+    const ctrlEph = generateEphemeral();
+    const sessionId = 'migration-session';
+    const host = new Session({
+      role: 'host',
+      link: a,
+      keys: deriveSessionKeys({ sessionId, localEphemeral: hostEph, peerPublicRaw: ctrlEph.publicKeyRaw, role: 'host' }),
+      sessionId,
+    });
+    const controller = new Session({
+      role: 'controller',
+      link: b,
+      keys: deriveSessionKeys({ sessionId, localEphemeral: ctrlEph, peerPublicRaw: hostEph.publicKeyRaw, role: 'controller' }),
+      sessionId,
+    });
+    host.start();
+    controller.start();
+    try {
+      // The host's public endpoint changes (new NAT mapping). Its packets
+      // keep arriving — from the new source — and the controller must
+      // start replying there without any renegotiation.
+      a.source = { address: '10.0.9.9', port: 61234 };
+      await waitFor(
+        () => b.remoteEndpoint?.address === '10.0.9.9' && b.remoteEndpoint?.port === 61234,
+        3000,
+        'path migration',
+      );
+      // And the host follows the controller in turn when it moves.
+      b.source = { address: '10.0.8.8', port: 62000 };
+      await waitFor(
+        () => a.remoteEndpoint?.address === '10.0.8.8' && a.remoteEndpoint?.port === 62000,
+        3000,
+        'reverse path migration',
+      );
+    } finally {
+      host.close();
+      controller.close();
     }
   });
 });

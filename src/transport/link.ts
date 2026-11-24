@@ -16,6 +16,15 @@ export interface Link {
   send(packet: Buffer): void;
   onMessage(cb: (data: Buffer, from?: Endpoint) => void): void;
   close(): void;
+  /**
+   * Current send target, when the link has one. Sessions use this for path
+   * migration: when authenticated packets start arriving from a different
+   * endpoint (the peer's NAT rebinding, a phone switching cells, an ISP
+   * reassigning its address), replies must follow the peer or the session
+   * dies on a path that no longer exists.
+   */
+  readonly remoteEndpoint?: Endpoint | null;
+  setRemote?(remote: Endpoint | null): void;
 }
 
 export class UdpLink implements Link {

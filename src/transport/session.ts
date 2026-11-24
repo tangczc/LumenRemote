@@ -1,4 +1,4 @@
-﻿import {
+import {
   AUTH_TAG_LEN,
   MAX_PAYLOAD,
   FRAME_HEADER_LEN,
@@ -123,12 +123,8 @@ const STATS_INTERVAL_MS = 500;
 const SWEEP_INTERVAL_MS = 200;
 const NACK_THROTTLE_MS = 20;
 const PARITY_TTL_MS = 500;
-/** Reception bitmap size. Must exceed RX_MEASURE_WINDOW + RX_REORDER_SLACK. */
+/** Reception bitmap size for duplicate detection / distinct-packet counting. */
 const RX_WINDOW = 2048;
-/** Measured loss window, in packets. */
-const RX_MEASURE_WINDOW = 1024;
-/** Newest sequence numbers excluded from the loss estimate (reordering slack). */
-const RX_REORDER_SLACK = 128;
 
 function unwrapTs32(ts32: number, refAbs: number): number {
   const two32 = 0x1_0000_0000;
@@ -181,6 +177,11 @@ export class Session {
   private rxBaseline = -1;
   private readonly rxWindow = new Uint8Array(RX_WINDOW);
   private readonly rxWindowSeq = new Uint32Array(RX_WINDOW);
+  /** Cumulative distinct packets received / expected (highest - baseline + 1). */
+  private rxDistinct = 0;
+  private rxExpected = 0;
+  private lastReportDistinct = 0;
+  private lastReportExpected = 0;
   private lastLossPct = 0;
   private rxBytes = 0;
   private rxPackets = 0;
@@ -196,6 +197,20 @@ export class Session {
   private timers: NodeJS.Timeout[] = [];
   private closed = false;
   private lastTargetBps = 0;
+  private lastMigrateMs = 0;
+
+  /** Follow an authenticated peer to its new endpoint (see onPacket). */
+  private maybeMigrate(from: { address: string; port: number }): void {
+    const link = this.link;
+    if (typeof link.setRemote !== 'function') return;
+    const current = link.remoteEndpoint;
+    if (current && current.address === from.address && current.port === from.port) return;
+    const now = Date.now();
+    if (now - this.lastMigrateMs < 250) return; // do not flap between two live paths
+    this.lastMigrateMs = now;
+    link.setRemote({ address: from.address, port: from.port });
+    this.log('info', `数据路径已跟随对端迁移到 ${from.address}:${from.port}`);
+  }
 
   constructor(private readonly opts: SessionOptions) {
     this.sessionId = opts.sessionId;
@@ -213,6 +228,10 @@ export class Session {
     });
     this.pacer = new Pacer({
       rateBps: this.cc.targetBps,
+      // 100 ms of queued media is the most an interactive session can
+      // afford; the 200 ms default let the pacer itself hold a fifth of a
+      // second of stale video before the network even got involved.
+      burstMs: 100,
       send: (p) => {
         this.txBytes += p.length;
         this.txPackets++;
@@ -222,7 +241,7 @@ export class Session {
       },
     });
 
-    this.link.onMessage((data) => this.onPacket(data));
+    this.link.onMessage((data, from) => this.onPacket(data, from));
   }
 
   start(): void {
@@ -428,7 +447,7 @@ export class Session {
 
   // -------------------------------------------------------------- receiving
 
-  private onPacket(packet: Buffer): void {
+  private onPacket(packet: Buffer, from?: { address: string; port: number }): void {
     if (this.closed || packet.length <= HEADER_LEN) return;
     let header;
     try {
@@ -442,6 +461,14 @@ export class Session {
       this.authFailures++;
       return;
     }
+    // Path migration: only a packet that passed AEAD can move the send
+    // target, so spoofed sources cannot hijack the path — but a genuine
+    // peer whose endpoint changed (mobile NAT rebinding, cell handover,
+    // CGNAT port reassignment) is followed immediately instead of the
+    // session talking to a dead address until the timeout. This is the
+    // common case behind "移动网络动不动就断": the peer never left,
+    // its return address changed.
+    if (from) this.maybeMigrate(from);
 
     this.rxBytes += packet.length;
     this.rxPackets++;
@@ -453,9 +480,13 @@ export class Session {
     if (this.rxWindow[slot] !== 1 || this.rxWindowSeq[slot] !== header.seq) {
       this.rxWindowSeq[slot] = header.seq;
       this.rxWindow[slot] = 1;
+      this.rxDistinct++;
     }
     const delta = this.rxHighest < 0 ? 0 : tsDelta32(header.seq, this.rxHighest);
-    if (this.rxHighest < 0 || delta > 0) this.rxHighest = header.seq;
+    if (this.rxHighest < 0 || delta > 0) {
+      this.rxHighest = header.seq;
+      this.rxExpected += delta > 0 ? delta : 1;
+    }
     if (this.rxBaseline < 0) this.rxBaseline = header.seq;
 
     const receiveUs = this.nowUs();
@@ -685,29 +716,28 @@ export class Session {
   }
 
   /**
-   * Loss measured over a sliding window that lags the highest seen sequence by
-   * `RX_REORDER_SLACK` packets, so reordering is not mistaken for loss.
+   * Loss for THIS report interval only, from cumulative counters.
+   *
+   * The old sliding-window measurement re-reported the same lost packets in
+   * every 20 ms report for about a second (the window spans 1024 packets),
+   * so one brief loss burst triggered the 0.75x decrease repeatedly and
+   * the rate collapsed long after the link had recovered. Interval deltas
+   * charge each loss exactly once. Late arrivals count as received in the
+   * interval they land, which can make an interval look lossless right
+   * after a lossy one — the cumulative counters stay honest overall.
    */
-  private measureLoss(): { lost: number; received: number; ratio: number } {
-    if (this.rxHighest < 0) return { lost: 0, received: 0, ratio: 0 };
-    const hi = this.rxHighest - RX_REORDER_SLACK;
-    // Sequence numbers below the first packet received were never used, so they
-    // must not be counted as loss.
-    const lo = Math.max(this.rxBaseline, hi - RX_MEASURE_WINDOW + 1);
-    let received = 0;
-    let total = 0;
-    for (let seq = lo; seq <= hi; seq++) {
-      total++;
-      const slot = seq & (RX_WINDOW - 1);
-      if (this.rxWindow[slot] === 1 && this.rxWindowSeq[slot] === seq) received++;
-    }
-    if (total === 0) return { lost: 0, received: 0, ratio: 0 };
-    const lost = total - received;
-    return { lost, received, ratio: lost / total };
+  private measureIntervalLoss(): { lost: number; received: number; ratio: number } {
+    const expected = this.rxExpected - this.lastReportExpected;
+    const received = this.rxDistinct - this.lastReportDistinct;
+    this.lastReportExpected = this.rxExpected;
+    this.lastReportDistinct = this.rxDistinct;
+    const lost = Math.max(0, expected - received);
+    const total = lost + received;
+    return { lost, received, ratio: total === 0 ? 0 : lost / total };
   }
 
   private sendReport(): void {
-    const loss = this.measureLoss();
+    const loss = this.measureIntervalLoss();
     this.lastLossPct = Math.min(100, loss.ratio * 100);
     const report: ReceiverReport = {
       hi: this.rxHighest < 0 ? 0 : this.rxHighest,

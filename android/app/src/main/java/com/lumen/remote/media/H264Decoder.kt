@@ -159,6 +159,12 @@ class H264Decoder(
         return try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, currentWidth, currentHeight)
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024)
+            // Ask the codec not to hold frames for reordering/smoothing:
+            // several devices otherwise add 2-4 frames of decode latency.
+            try {
+                format.setInteger("low-latency", 1)
+            } catch (_: Exception) {
+            }
             val c = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             c.configure(format, surface, null, 0)
             c.start()

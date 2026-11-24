@@ -555,7 +555,7 @@ function configureDecoder(cfg) {
       send({ type: 'keyframe' });
     },
   });
-  decoder.configure({ codec: cfg.codec, description, optimizeForLatency: true });
+  decoder.configure({ codec: cfg.codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
   state.decoder = decoder;
   logLine('info', `解码器就绪 ${cfg.codec}`);
 }
@@ -570,25 +570,17 @@ function teardownDecoder() {
   state.decoder = null;
 }
 
-let pendingFrame = null;
-let renderQueued = false;
-
 function onDecodedFrame(frame) {
-  // Only the newest decoded frame matters: holding older ones just adds a
-  // frame of latency and leaks VideoFrames that were never closed.
-  if (pendingFrame) {
-    try { pendingFrame.close(); } catch { /* ignore */ }
-  }
-  pendingFrame = frame;
-  if (renderQueued) return;
-  renderQueued = true;
-  requestAnimationFrame(drawFrame);
+  // Draw in the decoder's output callback instead of waiting for the
+  // next animation frame: rAF added up to a full vsync (16 ms) of pure
+  // latency to every frame for no benefit — the canvas is already
+  // `desynchronized`, and if frames ever arrive faster than the display
+  // can show them, drawing the newest immediately is still the right
+  // trade for an interactive session.
+  drawFrame(frame);
 }
 
-function drawFrame() {
-  renderQueued = false;
-  const frame = pendingFrame;
-  pendingFrame = null;
+function drawFrame(frame) {
   if (!frame) return;
   const canvas = $('#screen');
   if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -624,11 +616,17 @@ function handleVideo(buf) {
   // dropped until the next keyframe (and ask for one) rather than feeding
   // the decoder references it no longer has.
   const isKey = (flags & 1) !== 0;
-  if (isKey) state.waitingForKey = false;
-  else if (state.waitingForKey) return;
+  if (isKey) {
+    state.waitingForKey = false;
+    state.lastKeyAt = performance.now();
+  } else if (state.waitingForKey) return;
   else if (state.decoder.decodeQueueSize > 4) {
     state.waitingForKey = true;
-    send({ type: 'keyframe' });
+    // Asking for a keyframe restarts the host's encoder — a stall plus the
+    // biggest frame of the GOP into the congestion that caused this. The
+    // GOP (2 s) delivers a natural keyframe soon anyway, so only ask when
+    // none has been seen for a while, not on every queue hiccup.
+    if (performance.now() - (state.lastKeyAt ?? 0) > 1500) send({ type: 'keyframe' });
     return;
   }
   try {
@@ -683,10 +681,45 @@ const KEYMAP = {
 };
 
 let pendingMove = null;
-let moveQueued = false;
 let pendingAbs = null;
-let absQueued = false;
 let inputReady = false;
+
+/**
+ * Pointer motion is throttled to ~125 Hz by TIME, not by animation
+ * frames. The old rAF coalescing delayed every move by up to a vsync
+ * (16 ms) even when the link was idle — pure input latency added before
+ * the packet left the machine. 8 ms still collapses a 1000 Hz gaming
+ * mouse to a sane packet rate, and the trailing send guarantees the
+ * final resting position is never the one that got throttled away.
+ */
+const MOVE_INTERVAL_MS = 8;
+let lastMoveSentAt = 0;
+let moveTimer = 0;
+
+function flushMoves() {
+  moveTimer = 0;
+  lastMoveSentAt = performance.now();
+  const move = pendingMove;
+  const abs = pendingAbs;
+  pendingMove = null;
+  pendingAbs = null;
+  if (abs) {
+    send({ type: 'input', event: { k: 'ma', nx: abs.nx, ny: abs.ny } });
+    return;
+  }
+  if (!move) return;
+  if (Math.abs(move.dx) < 0.5 && Math.abs(move.dy) < 0.5) return;
+  send({ type: 'input', event: { k: 'mm', dx: Math.round(move.dx), dy: Math.round(move.dy) } });
+}
+
+function scheduleMoveFlush() {
+  const wait = MOVE_INTERVAL_MS - (performance.now() - lastMoveSentAt);
+  if (wait <= 0) {
+    flushMoves();
+    return;
+  }
+  if (!moveTimer) moveTimer = setTimeout(flushMoves, wait);
+}
 
 function queueMove(dx, dy) {
   if (pendingMove) {
@@ -695,33 +728,12 @@ function queueMove(dx, dy) {
   } else {
     pendingMove = { dx, dy };
   }
-  if (moveQueued) return;
-  moveQueued = true;
-  requestAnimationFrame(() => {
-    moveQueued = false;
-    const move = pendingMove;
-    pendingMove = null;
-    if (!move) return;
-    if (Math.abs(move.dx) < 0.5 && Math.abs(move.dy) < 0.5) return;
-    send({ type: 'input', event: { k: 'mm', dx: Math.round(move.dx), dy: Math.round(move.dy) } });
-  });
+  scheduleMoveFlush();
 }
 
-/**
- * Absolute moves are coalesced to one per frame: a 1000 Hz gaming mouse otherwise
- * floods the link with positions the screen never showed.
- */
 function queueAbsolute(nx, ny) {
   pendingAbs = { nx, ny };
-  if (absQueued) return;
-  absQueued = true;
-  requestAnimationFrame(() => {
-    absQueued = false;
-    const abs = pendingAbs;
-    pendingAbs = null;
-    if (!abs) return;
-    send({ type: 'input', event: { k: 'ma', nx: abs.nx, ny: abs.ny } });
-  });
+  scheduleMoveFlush();
 }
 
 function setupStageInput() {

@@ -1,4 +1,4 @@
-﻿import { spawn, spawnSync, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import { AccessUnitAssembler, type AccessUnit } from './nal.ts';
 
@@ -78,9 +78,16 @@ export function resolveCaptureMode(opts: EncoderOptions, ffmpegPath = 'ffmpeg'):
   if (opts.source.kind !== 'screen') return 'gdi';
   const mode = opts.source.mode ?? 'auto';
   if (mode === 'gdi') return 'gdi';
-  // ddagrab needs a hardware encoder to stay on the GPU; software x264 would
-  // have to download the frames anyway, so the older path is no worse there.
-  if (resolveEncoder(opts.encoder ?? 'auto', ffmpegPath) !== 'h264_nvenc') return 'gdi';
+  // Desktop Duplication for every encoder, not just NVENC. The old
+  // reasoning — "software encoders download the frames anyway, so GDI is
+  // no worse" — confused the download with the capture: gdigrab's BitBlt
+  // of a full desktop is the expensive, high-latency step (it stalls on
+  // vsync and copies through the CPU at any resolution), while DXGI
+  // duplication hands over frames the compositor already produced, and
+  // only changed regions move. NVENC keeps the frames on the GPU; other
+  // encoders pay one hwdownload, which is still far cheaper than GDI.
+  // If ddagrab fails at runtime the encoder falls back to gdigrab once
+  // (see ScreenEncoder), so preferring it is safe.
   return supportsDda(ffmpegPath) ? 'dda' : 'gdi';
 }
 
@@ -104,9 +111,14 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   // the host last used, and clicks seem to land "somewhere else". The
   // controller renders its own local cursor instantly instead (see the
   // stage canvas CSS), which is how commercial remote-desktop tools do it.
-  const ddaChain = scaleFilter
-    ? `ddagrab=framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter},format=nv12`
-    : `ddagrab=framerate=${fps}:draw_mouse=0`;
+  // Only NVENC can consume D3D11 surfaces directly; every other encoder
+  // (and any resize, which no scaler can do on GPU surfaces) round-trips
+  // through system memory with hwdownload. That copy is still much
+  // cheaper than a GDI capture of the same desktop.
+  const gpuDirect = encoder === 'h264_nvenc' && !scaleFilter;
+  const ddaChain = gpuDirect
+    ? `ddagrab=framerate=${fps}:draw_mouse=0`
+    : `ddagrab=framerate=${fps}:draw_mouse=0,hwdownload,format=bgra,${scaleFilter ? `${scaleFilter},` : ''}format=nv12`;
 
   const input =
     opts.source.kind === 'screen'
@@ -126,7 +138,14 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
           ]
       : ['-re', '-f', 'lavfi', '-i', `testsrc2=size=${opts.source.size ?? '1280x720'}:rate=${fps}`];
 
-  const rate = ['-b:v', `${kbps}k`, '-maxrate', `${kbps}k`, '-bufsize', `${Math.max(64, Math.round(kbps / 4))}k`, '-g', String(gop), '-bf', '0'];
+  // VBV buffer of ~3 frames. The old kbps/4 was 250 ms of rate-control
+  // smoothing: the encoder was allowed to "save up" bits for a quarter of
+  // a second, which is a quarter of a second of latency budget spent
+  // inside the encoder before the network sees a byte. Three frames
+  // keeps CBR honest without turning every keyframe into a burst that
+  // takes hundreds of milliseconds to drain.
+  const bufsizeK = Math.max(64, Math.round((kbps * 3) / fps));
+  const rate = ['-b:v', `${kbps}k`, '-maxrate', `${kbps}k`, '-bufsize', `${bufsizeK}k`, '-g', String(gop), '-bf', '0'];
   const common = captureMode === 'dda' ? rate : ['-pix_fmt', 'yuv420p', ...rate];
 
   const codecArgs: Record<EncoderName, string[]> = {
@@ -187,6 +206,7 @@ export class ScreenEncoder {
   private currentMode: 'dda' | 'gdi';
   private restarted = false;
   private stopped = false;
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly opts: EncoderOptions) {
     this.assembler = new AccessUnitAssembler((au) => {
@@ -214,7 +234,23 @@ export class ScreenEncoder {
     const startedAt = Date.now();
     this.framesSeen = 0;
 
-    proc.stdout.on('data', (chunk: Buffer) => this.assembler.push(chunk));
+    proc.stdout.on('data', (chunk: Buffer) => {
+      this.assembler.push(chunk);
+      // The assembler can only prove a picture is complete when the NEXT
+      // picture's first NAL arrives, which pipelines a full frame period
+      // (33 ms at 30 fps) of avoidable latency into every frame. FFmpeg
+      // flushes per access unit, so a few ms of stdout silence means the
+      // picture is done: flush then instead of waiting for its successor.
+      // A mid-picture chunk gap longer than this is vanishingly rare
+      // (the encoder writes a picture in one burst), and the fall-back is
+      // one corrupt frame, recovered at the next keyframe.
+      if (this.flushTimer) clearTimeout(this.flushTimer);
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.assembler.flush();
+      }, 4);
+      this.flushTimer.unref?.();
+    });
     proc.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trimEnd();
       if (text) {
@@ -255,6 +291,10 @@ export class ScreenEncoder {
 
   stop(): void {
     this.stopped = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (!this.proc) return;
     try {
       this.proc.kill();
