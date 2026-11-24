@@ -6,7 +6,7 @@ import {
   virtualBounds,
   type HostDisplay,
 } from '../src/host/display.ts';
-import { frameToVirtual } from '../src/host/injector.ts';
+import { frameToVirtual, InputInjector } from '../src/host/injector.ts';
 import { isSecureDesktopName } from '../src/host/secure-desktop.ts';
 import { decodeControl, encodeControl } from '../src/protocol/messages.ts';
 
@@ -123,6 +123,35 @@ describe('multi-display geometry', () => {
     assert.deepEqual(frameToVirtual(65535, 65535, rect, rect), { nx: 65535, ny: 65535 });
     const mid = frameToVirtual(32768, 32768, rect, rect);
     assert.ok(Math.abs(mid.nx - 32768) <= 1 && Math.abs(mid.ny - 32768) <= 1);
+  });
+
+  test('a panel restore changes where clicks land (why re-aiming matters)', () => {
+    // Dual-screen host: 2560x1440 primary (taken over) + 2160x3840
+    // portrait to its right. Restoring the primary to 3840x2160 moves
+    // the portrait panel and widens the virtual desktop; mapping the
+    // same frame fraction through the stale geometry lands up-left of
+    // the intended point — clicks "do nothing" anywhere right/below.
+    const staleRect = { x: 0, y: 0, width: 2560, height: 1440 };
+    const staleVirtual = { x: 0, y: 0, width: 2560 + 2160, height: 3840 };
+    const freshRect = { x: 0, y: 0, width: 3840, height: 2160 };
+    const freshVirtual = { x: 0, y: 0, width: 3840 + 2160, height: 3840 };
+    const stale = frameToVirtual(65535, 65535, staleRect, staleVirtual);
+    const fresh = frameToVirtual(65535, 65535, freshRect, freshVirtual);
+    assert.equal(fresh.nx, Math.round((3840 / 6000) * 65535));
+    assert.equal(fresh.ny, Math.round((2160 / 3840) * 65535));
+    assert.ok(stale.nx < fresh.nx && stale.ny < fresh.ny);
+  });
+
+  test('a stopped or disabled injector drops events without throwing', () => {
+    const off = new InputInjector({ enabled: false });
+    off.inject({ k: 'mb', b: 0, down: true });
+    assert.equal(off.droppedEvents, 1);
+    assert.equal(off.running, false);
+    const inj = new InputInjector({ enabled: true });
+    inj.stop(); // stopped before ever starting: inject must not resurrect it
+    inj.inject({ k: 'mb', b: 0, down: true });
+    assert.equal(inj.droppedEvents, 1);
+    assert.equal(inj.running, false);
   });
 });
 

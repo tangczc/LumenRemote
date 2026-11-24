@@ -1278,6 +1278,15 @@ async function startSession(
               await releasePanel('（主控请求真4K）');
               if (!active || active.role !== 'host') return;
               hostDisplays = await listDisplays(preset.fps);
+              // Re-aim the injector at the restored panel: absolute
+              // pointer mapping runs through the display rectangle, and
+              // the restore just changed it (2560x1440 -> 3840x2160,
+              // with the other panels shifting inside the virtual
+              // desktop). Skipping this left every click landing in a
+              // compressed top-left region — the controller looked
+              // completely dead, and switching quality back did not
+              // re-aim either, so only a reconnect recovered it.
+              aimInjector();
               startEncoder(active);
               sendDisplayList();
             })();

@@ -79,6 +79,8 @@ export class InputInjector {
   private proc: ChildProcess | null = null;
   private readonly enabled: boolean;
   private dropped = 0;
+  private stopped = false;
+  private lastStartAttempt = 0;
   /** Display the controller is looking at, and the desktop it sits in. */
   private target: { rect: DisplayRect; virtual: DisplayRect } | null = null;
 
@@ -97,6 +99,8 @@ export class InputInjector {
 
   start(): void {
     if (!this.enabled || this.proc) return;
+    this.stopped = false;
+    this.lastStartAttempt = Date.now();
     const shell = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
     const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT];
     const proc = spawn(shell, args, { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
@@ -121,8 +125,17 @@ export class InputInjector {
 
   inject(event: InputEvent): void {
     if (!this.proc?.stdin?.writable) {
-      this.dropped++;
-      return;
+      // Self-heal: the helper exiting mid-session (display-mode churn,
+      // a PowerShell hiccup) used to silence all input until the next
+      // reconnect — the picture kept moving, clicks just did nothing.
+      // Respawn it (throttled) instead of dropping events forever.
+      if (!this.stopped && Date.now() - this.lastStartAttempt > 2000) {
+        this.start();
+      }
+      if (!this.proc?.stdin?.writable) {
+        this.dropped++;
+        return;
+      }
     }
     const line = toLine(event, this.target);
     if (!line) return;
@@ -134,6 +147,7 @@ export class InputInjector {
   }
 
   stop(): void {
+    this.stopped = true;
     if (!this.proc) return;
     const proc = this.proc;
     this.proc = null;
