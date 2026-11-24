@@ -22,6 +22,7 @@ import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encode
 import { fitGeometryForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
+import { ForegroundMonitor } from '../host/foreground.ts';
 import {
   listDisplays,
   primaryDisplayIndex,
@@ -327,12 +328,16 @@ let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
 /**
- * True once the congestion controller has actually voted the link down
- * this session. adaptedBitrateKbps alone cannot signal that: it is
- * seeded with the slow-start value at every session start, so geometry
- * keyed on it would shrink every healthy session's first seconds.
+ * True once a measured congestion verdict (drop OR recovery step) has
+ * been applied this session. Geometry fitting keys on this — not on
+ * adaptedBitrateKbps alone (it is seeded with the slow-start value, so
+ * the first seconds of a healthy session would shrink), and not on
+ * drops alone: a session that only ever climbed from its seed in
+ * recovery steps still ended up encoding 2196x1236@60 at 3600 kbps
+ * (0.02 bits/px, pure smear) because the drop-only flag never opened
+ * the fitting gate.
  */
-let bitrateStarved = false;
+let verdictApplied = false;
 let lastBitrateAdaptAt = 0;
 /** Since when the congestion verdict has continuously justified a recovery. */
 let pendingRecoverAt = 0;
@@ -362,6 +367,10 @@ let bakeCursor = false;
 /** Secure desktop (UAC / lock screen) currently owns the host's screen. */
 let secureDesktop = { active: false, name: 'Default' };
 let desktopMonitor: SecureDesktopMonitor | null = null;
+let foregroundMonitor: ForegroundMonitor | null = null;
+/** Periodic re-enumeration of the host's displays during a session. */
+let displayWatchTimer: ReturnType<typeof setInterval> | null = null;
+let displayWatchBusy = false;
 /** Encoder crashes absorbed in the current session, so a broken capture cannot loop. */
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
@@ -629,6 +638,81 @@ function startDesktopMonitor(): void {
 }
 
 /**
+ * Log which application owns the host's foreground window. "Clicks do
+ * nothing while game X is in front" was undiagnosable from logs: the
+ * input chain counters proved delivery, but nothing recorded what was
+ * in front, whether it was fullscreen, or whether it had switched the
+ * display mode. Now the export says so.
+ */
+function startForegroundMonitor(): void {
+  foregroundMonitor?.stop();
+  foregroundMonitor = new ForegroundMonitor({
+    log,
+    onChange: (info) => {
+      if (!active || active.role !== 'host') return;
+      const sel = hostDisplays[active.displayIndex];
+      const full =
+        sel &&
+        info.x <= sel.x &&
+        info.y <= sel.y &&
+        info.width >= sel.width &&
+        info.height >= sel.height;
+      log(
+        'info',
+        `前台应用：${info.name} · 窗口 ${info.width}x${info.height}@${info.x},${info.y}${full ? '（全屏覆盖）' : ''}`,
+      );
+    },
+  });
+  foregroundMonitor.start();
+}
+
+/**
+ * Follow display-mode changes made by fullscreen applications. Games
+ * routinely switch the panel to their own resolution; everything in a
+ * session (capture geometry, negotiated size, pointer mapping) is
+ * keyed on the layout enumerated at connect time, so a mode switch
+ * silently invalidated all of it until the next reconnect. Re-enumerate
+ * periodically and re-aim everything at the new layout.
+ */
+function startDisplayWatcher(): void {
+  stopDisplayWatcher();
+  displayWatchTimer = setInterval(() => {
+    void watchDisplays();
+  }, 5000);
+}
+
+function stopDisplayWatcher(): void {
+  if (displayWatchTimer) clearInterval(displayWatchTimer);
+  displayWatchTimer = null;
+}
+
+async function watchDisplays(): Promise<void> {
+  const current = active;
+  if (!current || current.role !== 'host' || displayWatchBusy) return;
+  displayWatchBusy = true;
+  try {
+    const now = await listDisplays(preset.fps);
+    if (!active || active !== current) return;
+    const sig = (ds: HostDisplay[]) =>
+      ds.map((d) => `${d.index}:${d.x},${d.y},${d.width},${d.height}`).join(';');
+    if (sig(now) === sig(hostDisplays)) return;
+    log(
+      'warn',
+      `检测到显示布局变化（全屏应用可能切换了显示模式）：${hostDisplays.map(displayLabel).join(' · ')} → ${now.map(displayLabel).join(' · ')}，按新布局重新采集与瞄准`,
+    );
+    hostDisplays = now;
+    aimInjector();
+    current.encoder?.stop();
+    startEncoder(current);
+    sendDisplayList();
+  } catch {
+    /* enumeration hiccup: the next tick retries */
+  } finally {
+    displayWatchBusy = false;
+  }
+}
+
+/**
  * Move capture + control to another display at the controller's request.
  * Only the selected screen is captured and injected into; other displays
  * are never touched — in particular the panel takeover (resolution switch
@@ -688,8 +772,8 @@ function startEncoder(target: ActiveSession): void {
   // smaller frame also serialises much faster on a thin uplink, which
   // is where most of the input lag on a starved 4K stream comes from.
   // Healthy paths never see this: it only engages once a measured
-  // bitrate (or the relay cap) is in force.
-  if (bitrateStarved || relayBudget) {
+  // verdict (or the relay cap) is in force.
+  if (verdictApplied || relayBudget) {
     const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
     if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
       log(
@@ -1026,6 +1110,9 @@ function endSession(reason: string): void {
   }
   desktopMonitor?.stop();
   desktopMonitor = null;
+  foregroundMonitor?.stop();
+  foregroundMonitor = null;
+  stopDisplayWatcher();
   secureDesktop = { active: false, name: 'Default' };
   if (current.role === 'host') void releasePanel(reason);
   sendUi({ type: 'session-end', reason });
@@ -1203,7 +1290,7 @@ async function startSession(
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
-  bitrateStarved = false;
+  verdictApplied = false;
   lastBitrateAdaptAt = 0;
   pendingRecoverAt = 0;
   lastVerdictBps = 0;
@@ -1273,8 +1360,7 @@ async function startSession(
     // down and restarting the encoder again.
     adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
     if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
-    if (drop) bitrateStarved = true;
-    if (capped >= capKbps * 0.6) bitrateStarved = false;
+    verdictApplied = true;
     log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
     if (active.encoder) {
       active.encoder.stop();
@@ -1409,11 +1495,14 @@ async function startSession(
     },
     onStats: (s) => {
       sendUi({ type: 'stats', stats: toDto(s) });
-      // If a recovery has been continuously justified for 3 s but the
-      // verdict stopped moving (pinned at the ceiling), no further
-      // onBitrateChange arrives to execute it — re-run the last verdict
-      // from this heartbeat instead.
-      if (pendingRecoverAt > 0 && lastVerdictBps > 0 && Date.now() - pendingRecoverAt >= 3000) {
+      // Re-run the last verdict from this heartbeat: once the
+      // congestion target pins at the ceiling it stops changing, so no
+      // further onBitrateChange arrives — without this, a recovery
+      // armed (or due its next 1.5x step) was never executed and the
+      // encoder froze at its first stepped rate for the whole session
+      // while the stats claimed a 31M target. The verdict's own
+      // sustained/cadence gates throttle how often this can act.
+      if (active?.role === 'host' && lastVerdictBps > 0) {
         applyVerdict(lastVerdictBps);
       }
       // A 10 s stats heartbeat in the log file is what makes "it stuttered
@@ -1500,6 +1589,8 @@ async function startSession(
     aimInjector();
     sendDisplayList();
     startDesktopMonitor();
+    startForegroundMonitor();
+    startDisplayWatcher();
   }
 
   // The controller's quality choice drives the host's encoder; without
