@@ -107,6 +107,10 @@ class Session(
     private var rxBaseline = -1L
     private val rxWindow = ByteArray(RX_WINDOW)
     private val rxWindowSeq = LongArray(RX_WINDOW)
+    private var rxDistinct = 0L
+    private var rxExpected = 0L
+    private var lastReportDistinct = 0L
+    private var lastReportExpected = 0L
     private var lastLossPct = 0.0
 
     @Volatile
@@ -517,22 +521,20 @@ class Session(
         }
     }
 
+    /**
+     * Loss for this report interval only (mirrors the TypeScript fix): the
+     * old sliding window re-reported the same losses in every report for
+     * ~1 s, so one burst collapsed the rate long after recovery.
+     */
     private fun measureLoss(): Triple<Int, Int, Double> {
-        if (rxHighest < 0) return Triple(0, 0, 0.0)
-        val hi = rxHighest - RX_REORDER_SLACK
-        val lo = maxOf(rxBaseline, hi - RX_MEASURE_WINDOW + 1)
-        var received = 0
-        var total = 0
-        var seq = lo
-        while (seq <= hi) {
-            total++
-            val slot = (seq and (RX_WINDOW - 1).toLong()).toInt()
-            if (rxWindow[slot].toInt() == 1 && rxWindowSeq[slot] == seq) received++
-            seq++
-        }
-        if (total == 0) return Triple(0, 0, 0.0)
-        val lost = total - received
-        return Triple(lost, received, lost.toDouble() / total)
+        val expected = rxExpected - lastReportExpected
+        val received = rxDistinct - lastReportDistinct
+        lastReportExpected = rxExpected
+        lastReportDistinct = rxDistinct
+        val lost = maxOf(0L, expected - received)
+        val total = lost + received
+        if (total == 0L) return Triple(0, 0, 0.0)
+        return Triple(lost.toInt(), received.toInt(), lost.toDouble() / total)
     }
 
     private fun sendReport() {
@@ -648,7 +650,5 @@ class Session(
         private const val NACK_THROTTLE_MS = 20L
         private const val PARITY_TTL_MS = 500L
         private const val RX_WINDOW = 2048
-        private const val RX_MEASURE_WINDOW = 1024L
-        private const val RX_REORDER_SLACK = 128L
     }
 }

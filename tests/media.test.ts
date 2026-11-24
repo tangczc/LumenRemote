@@ -193,6 +193,17 @@ describe('encode size negotiation', () => {
     assert.equal(scaleBitrate(6_000, host, { width: 640, height: 360 }), 2_500);
   });
 
+  test('keeps the VBV buffer at about three frames', () => {
+    // A large VBV buffer is latency the encoder hides from the network:
+    // kbps/4 at 12 Mbps is 250 ms of smoothing. Three frames (~50 ms at
+    // the 60 fps default) keeps bursts honest without starving CBR.
+    const base = { source: { kind: 'screen' as const, mode: 'gdi' as const }, encoder: 'libx264' as const, onAccessUnit: () => {} };
+    const args = buildEncoderArgs(base);
+    assert.equal(args[args.indexOf('-bufsize') + 1], '600k');
+    const args30 = buildEncoderArgs({ ...base, fps: 30, bitrateKbps: 8_000 });
+    assert.equal(args30[args30.indexOf('-bufsize') + 1], '800k');
+  });
+
   test('does not bake the host cursor into the video', () => {
     // The controller renders its own local cursor; a baked-in one lags
     // behind the real pointer and makes clicks feel mis-aimed.

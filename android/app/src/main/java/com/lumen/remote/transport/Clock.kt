@@ -137,6 +137,7 @@ class CongestionController(
     private var hasReport = false
     private var consecutiveClean = 0
     private var overuseStreak = 0
+    private var growStreak = 0
 
     var srttUs = 0.0
         private set
@@ -152,7 +153,9 @@ class CongestionController(
         val sinceReport = now - lastReportMs
         lastReportMs = now
 
-        this.lossRate = lossRate
+        // EWMA loss: one lost packet in a 20 ms interval otherwise reads
+        // as 5-30% loss and slams the rate down repeatedly.
+        this.lossRate = if (hasReport) this.lossRate * 0.6 + lossRate * 0.4 else lossRate
         srttUs = if (srttUs == 0.0) rttUs.toDouble() else srttUs * 0.9 + rttUs * 0.1
 
         if (!hasReport || (sinceReport > 0 && sinceReport < 500)) {
@@ -160,9 +163,11 @@ class CongestionController(
         }
         hasReport = true
 
-        val overusing = trendUs > 20_000
-        val lossy = lossRate > 0.05
-        val mildlyLossy = lossRate > 0.02
+        // delayGradientUs is total queue growth per ~20 ms interval.
+        val overusing = trendUs > 6_000
+        val queueGrowing = trendUs > 1_200
+        val lossy = this.lossRate > 0.05
+        val mildlyLossy = this.lossRate > 0.02
 
         if (overusing || lossy) {
             overuseStreak = if (overusing) overuseStreak + 1 else 0
@@ -176,12 +181,21 @@ class CongestionController(
         }
 
         overuseStreak = 0
+
+        growStreak = if (queueGrowing) growStreak + 1 else 0
+        if (growStreak >= 15 && now - lastDecreaseMs > 200) {
+            target = maxOf(minBps, target * 0.9)
+            lastDecreaseMs = now
+            growStreak = 0
+            consecutiveClean = 0
+            return
+        }
+
         if (mildlyLossy) {
             consecutiveClean = 0
             return
         }
 
-        val queueGrowing = trendUs > 5_000
         consecutiveClean = if (queueGrowing) 0 else consecutiveClean + 1
         if (!queueGrowing && consecutiveClean >= 2 && now - lastDecreaseMs > 300 && now - lastIncreaseMs > 120) {
             target = minOf(maxBps, target * 1.25 + 48_000)

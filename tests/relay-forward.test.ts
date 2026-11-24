@@ -119,3 +119,110 @@ test('relay forwards datagrams between the two peers', async () => {
   ctrl.udp.close();
   server.close();
 });
+
+test('relay follows a peer that re-registers from a new endpoint', async (t) => {
+  // Mobile reality: the endpoint the server observed for a peer changes
+  // mid-session (NAT rebinding, cell handover). The client re-discovers
+  // and re-registers; the relay must forward to the NEW endpoint, not the
+  // first one it ever saw.
+  const server = new SignalingServer({ tcpPort: 0, udpPort: 0, bindAddress: '127.0.0.1', log: () => {} });
+  const ports = await server.listen();
+  const cleanups: (() => void)[] = [() => server.close()];
+  t.after(() => {
+    for (const fn of cleanups.reverse()) {
+      try {
+        fn();
+      } catch {
+        /* already closed */
+      }
+    }
+  });
+
+  async function discover(udp: dgram.Socket): Promise<string> {
+    const reply = new Promise<any>((resolve) => udp.once('message', (msg) => resolve(JSON.parse(msg.toString('utf8')))));
+    udp.send(Buffer.from([0x01]), ports.udpPort, '127.0.0.1');
+    return (await reply).token as string;
+  }
+
+  async function makePeer(name: string, udp: dgram.Socket) {
+    const token = await discover(udp);
+    const socket = net.createConnection({ host: '127.0.0.1', port: ports.tcpPort });
+    cleanups.push(() => socket.destroy());
+    let buffer = '';
+    const queue: any[] = [];
+    const waiters: ((msg: any) => void)[] = [];
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      let idx = buffer.indexOf('\n');
+      while (idx >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line.trim()) {
+          const msg = JSON.parse(line);
+          const waiter = waiters.shift();
+          if (waiter) waiter(msg);
+          else queue.push(msg);
+        }
+        idx = buffer.indexOf('\n');
+      }
+    });
+    const send = (msg: unknown) => socket.write(JSON.stringify(msg) + '\n');
+    const next = () =>
+      new Promise<any>((resolve) => {
+        const queued = queue.shift();
+        if (queued) resolve(queued);
+        else waiters.push(resolve);
+      });
+    await once(socket, 'connect');
+    send({ t: 'hello', deviceId: name, name, os: 'win32', hostable: true });
+    const welcome = await next();
+    return { socket, send, next, token, code: welcome.code as string };
+  }
+
+  const bindUdp = async (): Promise<dgram.Socket> => {
+    const udp = dgram.createSocket('udp4');
+    await new Promise<void>((resolve) => udp.bind(0, '127.0.0.1', () => resolve()));
+    cleanups.push(() => udp.close());
+    return udp;
+  };
+
+  const hostUdp1 = await bindUdp();
+  const hostUdp2 = await bindUdp();
+  const ctrlUdp = await bindUdp();
+  const host = await makePeer('mover-host', hostUdp1);
+  const ctrl = await makePeer('mover-ctrl', ctrlUdp);
+
+  host.send({ t: 'udp-token', token: host.token, endpoint: { address: '127.0.0.1', port: hostUdp1.address().port } });
+  ctrl.send({ t: 'udp-token', token: ctrl.token, endpoint: { address: '127.0.0.1', port: ctrlUdp.address().port } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const sessionId = 'relay-move-session';
+  ctrl.send({ t: 'connect', sessionId, targetCode: host.code, password: 'pw', eph: 'AAAA', candidates: [] });
+  assert.equal((await host.next()).t, 'incoming');
+  host.send({ t: 'accept', sessionId, password: 'pw', eph: 'BBBB', candidates: [] });
+  await host.next();
+  await ctrl.next();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  // The host's network path changes: it re-discovers from a new socket
+  // (a new observed endpoint) and re-registers.
+  const token2 = await discover(hostUdp2);
+  host.send({ t: 'udp-token', token: token2, endpoint: { address: '127.0.0.1', port: hostUdp2.address().port } });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  const arrived = new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('datagram never reached the new endpoint')), 2000);
+    hostUdp2.once('message', (m) => {
+      clearTimeout(timer);
+      resolve(m.toString('utf8'));
+    });
+  });
+  let staleHit = false;
+  hostUdp1.once('message', () => {
+    staleHit = true;
+  });
+  ctrlUdp.send(Buffer.from('after-move'), ports.udpPort, '127.0.0.1');
+  assert.equal(await arrived, 'after-move');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(staleHit, false, 'relay must not keep forwarding to the stale endpoint');
+});

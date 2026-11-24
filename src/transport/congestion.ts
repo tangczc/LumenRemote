@@ -35,6 +35,7 @@ export class CongestionController {
   private hasReport = false;
   private consecutiveClean = 0;
   private overuseStreak = 0;
+  private growStreak = 0;
 
   /** Smoothed RTT in µs. */
   srttUs = 0;
@@ -63,7 +64,11 @@ export class CongestionController {
     const sinceReport = now - this.lastReportMs;
     this.lastReportMs = now;
 
-    this.lossRate = s.lossRate;
+    // Smooth the loss signal: reports arrive every 20 ms, so a single lost
+    // packet in a quiet interval reads as 5-30% loss and used to slam the
+    // rate down by 25% every 200 ms. The EWMA keeps real loss bursts
+    // decisive while ignoring one-packet noise.
+    this.lossRate = this.hasReport ? this.lossRate * 0.6 + s.lossRate * 0.4 : s.lossRate;
     this.srttUs = this.srttUs === 0 ? s.rttUs : this.srttUs * 0.9 + s.rttUs * 0.1;
 
     // Only accumulate gradient when reports actually arrive in sequence.
@@ -73,9 +78,15 @@ export class CongestionController {
     }
     this.hasReport = true;
 
-    const overusing = this.trendUs > 20_000; // ~20 ms of standing queue
-    const lossy = s.lossRate > 0.05;
-    const mildlyLossy = s.lossRate > 0.02;
+    // delayGradientUs is now the TOTAL queue growth over one report
+    // interval (~20 ms), so the thresholds are on that scale: a queue
+    // growing >6 ms per interval is being fed far beyond capacity, while
+    // >1.2 ms per interval sustained still means the queue grows without
+    // bound, just slower.
+    const overusing = this.trendUs > 6_000;
+    const queueGrowing = this.trendUs > 1_200;
+    const lossy = this.lossRate > 0.05;
+    const mildlyLossy = this.lossRate > 0.02;
 
     if (overusing || lossy) {
       this.overuseStreak = overusing ? this.overuseStreak + 1 : 0;
@@ -92,6 +103,18 @@ export class CongestionController {
 
     this.overuseStreak = 0;
 
+    // A queue that keeps growing slowly is still growing: back off gently
+    // after ~300 ms of it instead of increasing into it forever.
+    this.growStreak = queueGrowing ? this.growStreak + 1 : 0;
+    if (this.growStreak >= 15 && now - this.lastDecreaseMs > 200) {
+      this.target = Math.max(this.minBps, this.target * 0.9);
+      this.lastDecreaseMs = now;
+      this.growStreak = 0;
+      this.consecutiveClean = 0;
+      this.state = 'decrease';
+      return;
+    }
+
     if (mildlyLossy) {
       this.state = 'hold';
       this.consecutiveClean = 0;
@@ -101,7 +124,6 @@ export class CongestionController {
     // Do not add rate while any measurable queue is building; a rising trend
     // means the link is already at its limit even before it crosses the
     // overuse threshold.
-    const queueGrowing = this.trendUs > 5_000;
     this.consecutiveClean = queueGrowing ? 0 : this.consecutiveClean + 1;
 
     if (!queueGrowing && this.consecutiveClean >= 2 && now - this.lastDecreaseMs > 300 && now - this.lastIncreaseMs > 120) {
@@ -166,9 +188,22 @@ export class DelayGradientEstimator {
     this.samples++;
   }
 
-  /** Average queue growth in µs over the interval, then reset. */
+  /**
+   * Total queue growth in µs over the interval, then reset.
+   *
+   * This used to return the per-packet MEAN drift (accumulated / samples).
+   * That was a units bug with fatal consequences: on a real link the mean
+   * drift is tens of microseconds per packet, while the congestion
+   * controller's thresholds are milliseconds of queue growth — so the
+   * delay signal could never fire, and under router bufferbloat (deep
+   * queues, ~0% loss) the sender never backed off at all. The link filled
+   * with seconds of stale video and P2P felt unusable while the loss
+   * signal still reported a healthy path. The accumulated sum telescopes
+   * to (lastArrival - firstArrival) - (lastSend - firstSend), i.e. how
+   * much the queue actually grew during the report interval.
+   */
   take(): number {
-    const v = this.samples === 0 ? 0 : this.accumulatedUs / this.samples;
+    const v = this.accumulatedUs;
     this.accumulatedUs = 0;
     this.samples = 0;
     return v;

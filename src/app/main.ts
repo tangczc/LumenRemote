@@ -10,7 +10,7 @@ import { hasGlobalIpv6, lanAddresses, localCandidates, toCanonical } from '../ne
 import { requestPortMapping, type PortMapping } from '../net/nat.ts';
 import { UdpLink } from '../transport/link.ts';
 import { Session, type IncomingFrame } from '../transport/session.ts';
-import { pickRelayAddress, selectDataPath } from '../transport/path.ts';
+import { pickRelayAddress, selectDataPath, type PathResult } from '../transport/path.ts';
 import { deriveSessionKeys, generateEphemeral, randomId, safeEqual, type EphemeralKeyPair } from '../protocol/crypto.ts';
 import { randomBytes, createHmac } from 'node:crypto';
 import { deriveAccessCode, generateAccessCode } from './access-code.ts';
@@ -43,7 +43,7 @@ import {
   type UiToApp,
   type VerifyMode,
 } from '../ui/bridge.ts';
-import type { ServerToClient } from '../signaling/protocol.ts';
+import type { Candidate, ServerToClient } from '../signaling/protocol.ts';
 
 /**
  * Unified remote-control client.
@@ -63,6 +63,15 @@ const VERSION = '0.2.0';
  */
 const RELAY_NET_KBPS = 4_000;
 const RELAY_FPS = 30;
+/**
+ * Sessions start at this rate and let the congestion controller probe up to
+ * the preset. Starting at the full preset (10 Mbps for balanced) instantly
+ * saturated a slower home uplink: the router queued seconds of video
+ * before the first receiver report could come back, and the session never
+ * recovered its latency. The ramp (x1.25 every ~120 ms on a clean path)
+ * reaches the preset in about a second when the bandwidth is really there.
+ */
+const START_NET_BPS = 3_000_000;
 
 /**
  * Signalling server a fresh install talks to. Both clients default to the same
@@ -247,6 +256,12 @@ interface ActiveSession {
   encoder?: ScreenEncoder;
   /** Frame size actually put on the wire, which may be smaller than the capture. */
   videoSize?: { width: number; height: number };
+  /** Peer candidates from session setup, kept so a dead path can be re-probed mid-session. */
+  peerCandidates: Candidate[];
+  /** Relay endpoint from session setup, the re-probe's fallback target. */
+  relayEndpoint: { address: string; port: number };
+  /** Cancels a background relay->P2P upgrade loop belonging to this session. */
+  cancelUpgrade?: () => void;
 }
 
 let active: ActiveSession | null = null;
@@ -293,6 +308,30 @@ let portMapping: PortMapping | null = null;
 
 let signaling: SignalingClient | null = null;
 let discovery: { token: string; endpoint: { address: string; port: number } } | null = null;
+/** UDP port of the signalling server, learned from its welcome message. */
+let signalUdpPort = 7802;
+let lastDiscoveryAt = 0;
+
+/**
+ * Re-run UDP endpoint discovery and re-register with the signalling server.
+ *
+ * On a mobile network the endpoint the server observes changes over time
+ * (NAT rebinding, cell handover); the relay forwards by that observed
+ * endpoint, so a registration made at connect time points at a dead
+ * address exactly when the session falls back to the relay. Refreshing
+ * keeps the fallback path real.
+ */
+async function refreshDiscovery(): Promise<void> {
+  if (!signaling || !signalOnline) return;
+  try {
+    const found = await discoverUdpEndpoint(link.raw, state.signalHost, signalUdpPort);
+    discovery = found;
+    lastDiscoveryAt = Date.now();
+    signaling.send({ t: 'udp-token', token: found.token, endpoint: found.endpoint });
+  } catch {
+    /* best effort: the next watchdog round tries again */
+  }
+}
 let deviceCode = '';
 let signalOnline = false;
 
@@ -535,7 +574,9 @@ async function connectSignaling(): Promise<void> {
       saveState(state);
     }
     signalOnline = true;
+    signalUdpPort = welcome.udpPort;
     discovery = await discoverUdpEndpoint(link.raw, state.signalHost, welcome.udpPort);
+    lastDiscoveryAt = Date.now();
     if (discovery) client.send({ t: 'udp-token', token: discovery.token, endpoint: discovery.endpoint });
     log('info', `设备 ID ${deviceCode} · 信令 ${state.signalHost}:${state.signalPort}`);
     emitDevice();
@@ -694,6 +735,7 @@ function endSession(reason: string): void {
   avcConfig = null;
   relayBudget = false;
   if (current) {
+    current.cancelUpgrade?.();
     current.encoder?.stop();
     current.session.close(reason);
     if (current.role === 'host') injector.stop();
@@ -704,14 +746,94 @@ function endSession(reason: string): void {
   rotateOnceCode();
 }
 
+/** Wire the background relay->P2P upgrade for a path that landed on the relay. */
+function wireRelayUpgrade(path: PathResult): void {
+  if (path.route !== 'relay' || !path.upgrade) return;
+  path.upgrade((endpoint) => {
+    log('info', `数据通道升级为 P2P 直连 ${endpoint.address}:${endpoint.port}`);
+    if (active) active.route = 'p2p';
+    sendUi({ type: 'session-route', route: 'p2p' });
+    if (relayBudget) {
+      relayBudget = false;
+      log('info', `恢复 P2P 画质：码率上限 ${preset.netKbps} kbps · ${preset.fps} fps`);
+      active?.session.setMaxBudget(preset.netKbps * 1000);
+      if (active?.role === 'host') startEncoder(active);
+    }
+  });
+  if (active) active.cancelUpgrade = path.cancelUpgrade;
+}
+
+let reprobing = false;
+let lastReprobeAt = 0;
+
 /**
- * Both peers ping every 250 ms, so silence means the other side is gone — most
- * often a phone that was killed or lost Wi-Fi without a chance to say bye. The
- * host must not stay in its "being controlled" card forever.
+ * Re-run path selection for a live session whose path went silent.
+ *
+ * Previously the route chosen at connect time was final: if the peer's
+ * endpoint changed (mobile NAT rebinding, cell handover) or the punch
+ * decayed, both sides talked to a dead address for 8 s and then hung up.
+ * Now 4 s of silence triggers a re-probe — candidates plus the relay,
+ * with the relay registration refreshed first — and the session only
+ * ends after 25 s of total silence. Session-level path migration (see
+ * Session.maybeMigrate) heals the common endpoint-change case even
+ * before this fires.
+ */
+async function reprobePath(): Promise<void> {
+  const current = active;
+  if (!current || reprobing) return;
+  if (Date.now() - lastReprobeAt < 6000) return;
+  reprobing = true;
+  lastReprobeAt = Date.now();
+  log('warn', '数据通道无响应，正在重新探测路径…');
+  try {
+    await refreshDiscovery();
+    const path = await selectDataPath({
+      link,
+      session: current.session,
+      candidates: values['force-relay'] ? [] : current.peerCandidates,
+      relay: current.relayEndpoint,
+    });
+    if (!active || active !== current) return;
+    current.cancelUpgrade?.();
+    current.route = path.route;
+    sendUi({ type: 'session-route', route: path.route });
+    log('info', `数据通道重新探测完成：${path.route === 'p2p' ? 'P2P 直连' : '中继转发'} ${path.endpoint.address}:${path.endpoint.port}`);
+    const wasRelay = relayBudget;
+    relayBudget = path.route === 'relay';
+    if (current.role === 'host' && relayBudget !== wasRelay) {
+      if (relayBudget) {
+        const cap = Math.min(preset.netKbps, RELAY_NET_KBPS);
+        current.session.setMaxBudget(cap * 1000);
+        log('info', `已切换到中继：码率上限 ${cap} kbps · 帧率上限 ${RELAY_FPS} fps（打通 P2P 后自动恢复）`);
+      } else {
+        current.session.setMaxBudget(preset.netKbps * 1000);
+        log('info', `已恢复 P2P：码率上限 ${preset.netKbps} kbps`);
+      }
+      startEncoder(current);
+    }
+    wireRelayUpgrade(path);
+  } catch (err) {
+    log('warn', `重新探测路径失败: ${(err as Error).message}`);
+  } finally {
+    reprobing = false;
+  }
+}
+
+/**
+ * Both peers ping every 250 ms, so silence means the path (or the peer) is
+ * gone. A dead path gets re-probed long before the session is declared
+ * over; only sustained silence ends it, so a host is not left in its
+ * "being controlled" card forever when a phone is truly killed.
  */
 setInterval(() => {
   if (!active) return;
-  if (Date.now() - lastPeerAt > 8000) endSession('连接超时（对方已离线）');
+  const silenceMs = Date.now() - lastPeerAt;
+  if (silenceMs > 25000) {
+    endSession('连接超时（对方已离线）');
+    return;
+  }
+  if (silenceMs > 4000) void reprobePath();
+  if (Date.now() - lastDiscoveryAt > 30000) void refreshDiscovery();
 }, 3000).unref?.();
 
 async function startSession(
@@ -767,7 +889,10 @@ async function startSession(
     password: msg.password,
   });
   autoRestarts = 0;
-  adaptedBitrateKbps = 0;
+  // Seed the encoder at the slow-start rate too: an encoder producing the
+  // full preset into a 3 Mbps pacer just gets its frames dropped until the
+  // first congestion adaptation lands seconds later.
+  adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
   lastBitrateAdaptAt = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
@@ -779,7 +904,7 @@ async function startSession(
     link,
     keys,
     sessionId: msg.sessionId,
-    initialBitrateBps: preset.netKbps * 1000,
+    initialBitrateBps: Math.min(preset.netKbps * 1000, START_NET_BPS),
     maxBitrateBps: preset.netKbps * 1000,
     logger: (level, message) => log(level === 'debug' ? 'info' : level, message),
     onInput: (event) => injector.inject(event),
@@ -816,7 +941,12 @@ async function startSession(
       }
       if (ctl.t !== 'idr' || role !== 'host' || !active) return;
       const now = Date.now();
-      if (now - lastKeyframeRestart > 2000) {
+      // Restarting the encoder means a pipeline stall plus the largest
+      // frame of the GOP straight into whatever congestion prompted the
+      // request. 2 s let a struggling controller trigger that cycle
+      // continuously; the GOP (2 s) bounds the wait for a natural IDR
+      // anyway, so only honour explicit requests at a calmer cadence.
+      if (now - lastKeyframeRestart > 5000) {
         lastKeyframeRestart = now;
         active.encoder?.stop();
         startEncoder(active);
@@ -830,11 +960,16 @@ async function startSession(
       // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
       if (!active || active.role !== 'host' || !active.encoder) return;
       const now = Date.now();
-      if (now - lastBitrateAdaptAt < 4000) return;
+      if (now - lastBitrateAdaptAt < 8000) return;
       const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
       const current = adaptedBitrateKbps > 0 ? adaptedBitrateKbps : preset.bitrateKbps;
-      const drop = kbps < current * 0.7;
-      const recover = adaptedBitrateKbps > 0 && kbps > current * 1.4;
+      // Wide hysteresis: restarting the encoder costs a pipeline stall
+      // plus a keyframe burst, so on a healthy-but-variable link the cure
+      // was worse than the disease — a visible freeze every few seconds.
+      // Only a deep, sustained mismatch (40%+) justifies the restart;
+      // the pacer absorbs anything smaller by dropping frames.
+      const drop = kbps < current * 0.6;
+      const recover = adaptedBitrateKbps > 0 && kbps > current * 1.5;
       if (!drop && !recover) return;
       lastBitrateAdaptAt = now;
       adaptedBitrateKbps = kbps;
@@ -871,19 +1006,6 @@ async function startSession(
   // budget does not fit: pin the session to a relay-friendly ceiling and let the
   // congestion controller work below it. Restored if punching succeeds later.
   relayBudget = path.route === 'relay';
-  if (path.route === 'relay' && path.upgrade) {
-    path.upgrade((endpoint) => {
-      log('info', `数据通道升级为 P2P 直连 ${endpoint.address}:${endpoint.port}`);
-      if (active) active.route = 'p2p';
-      sendUi({ type: 'session-route', route: 'p2p' });
-      if (relayBudget) {
-        relayBudget = false;
-        log('info', `恢复 P2P 画质：码率上限 ${preset.netKbps} kbps · ${preset.fps} fps`);
-        active?.session.setMaxBudget(preset.netKbps * 1000);
-        if (active?.role === 'host') startEncoder(active);
-      }
-    });
-  }
 
   active = {
     session,
@@ -893,7 +1015,10 @@ async function startSession(
     route: path.route,
     startedAt: Date.now(),
     sessionId: msg.sessionId,
+    peerCandidates: values['force-relay'] ? [] : msg.peerCandidates,
+    relayEndpoint: relay,
   };
+  wireRelayUpgrade(path);
   lastPeerAt = Date.now();
 
   if (role === 'host') {
