@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '../src/media/nal.ts';
-import { annexBToAvcc, buildAvcC, codecString, extractParameterSets } from '../src/media/avc.ts';
+import { annexBToAvcc, buildAvcC, codecString, extractParameterSets, streamConfigChanged } from '../src/media/avc.ts';
 import { negotiateSize, scaleBitrate } from '../src/media/target.ts';
 import { buildEncoderArgs } from '../src/media/encoder.ts';
 
@@ -125,6 +125,27 @@ describe('avc configuration', () => {
       { type: 8, data: pps },
     ]);
     assert.ok(sets.sps && sets.pps);
+  });
+
+  test('detects a mid-session parameter change even when the codec string is identical', () => {
+    // Two SPS with the same profile/level bytes (same RFC6381 codec
+    // string) but different tails — e.g. an encoder restarted at a new
+    // resolution. Keying decoder configuration on the codec string
+    // alone misses this, which used to freeze the controller picture
+    // permanently while session stats stayed healthy.
+    const pps = Buffer.from([0x68, 0xce, 0x3c, 0x80]);
+    const spsA = Buffer.from([0x67, 0x64, 0x00, 0x28, 0xac, 0x72, 0x84, 0x40]);
+    const spsB = Buffer.from([0x67, 0x64, 0x00, 0x28, 0xac, 0xb8, 0x20, 0x10]);
+    assert.equal(codecString(spsA), codecString(spsB));
+
+    const first = streamConfigChanged(null, spsA, pps);
+    assert.ok(first);
+    assert.equal(streamConfigChanged(first, spsA, pps), null);
+
+    const changed = streamConfigChanged(first, spsB, pps);
+    assert.ok(changed);
+    assert.equal(changed.codec, first.codec);
+    assert.ok(!changed.avcC.equals(first.avcC));
   });
 
   test('converts annex-b to length-prefixed samples', () => {

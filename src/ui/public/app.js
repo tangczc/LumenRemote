@@ -700,6 +700,7 @@ function exitSession(reason) {
   leaveHostMode();
   $('#btnConnect').disabled = false;
   teardownDecoder();
+  state.lastConfig = null;
   if (document.pointerLockElement) document.exitPointerLock();
   if (reason) {
     toast(reason, 'warn');
@@ -711,9 +712,16 @@ function exitSession(reason) {
 /* --------------------------------------------------------------- decoding */
 
 function configureDecoder(cfg) {
-  const key = cfg.codec;
+  state.lastConfig = cfg;
+  // Key on codec AND avcC: a host encoder restart at a new resolution
+  // changes the SPS (inside avcC) but not the codec string. Keying on the
+  // codec alone kept the old decoder chewing new-size frames until it
+  // errored — and with no new config ever arriving, that freeze was
+  // permanent while the session stats looked perfectly healthy.
+  const key = `${cfg.codec}|${cfg.avcC}`;
   if (state.configuredKey === key && state.decoder?.state === 'configured') return;
   state.configuredKey = key;
+  state.lastDecoderBuildAt = performance.now();
 
   if (typeof VideoDecoder === 'undefined') {
     $('#overlayText').textContent = '当前浏览器不支持 WebCodecs 解码';
@@ -726,14 +734,31 @@ function configureDecoder(cfg) {
     output: onDecodedFrame,
     error: (err) => {
       logLine('error', `解码失败 ${err.message}`);
-      state.decoder = null;
+      if (state.decoder === decoder) state.decoder = null;
       state.configuredKey = '';
+      // Rebuild from the last config we were given instead of waiting
+      // for a config message that may never come (the engine only sends
+      // one when the stream parameters actually change). A fresh
+      // decoder plus a keyframe is a full recovery on its own.
+      rebuildDecoder();
       send({ type: 'keyframe' });
     },
   });
   decoder.configure({ codec: cfg.codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
   state.decoder = decoder;
+  // A fresh decoder has no reference frames; drop deltas until the next
+  // keyframe (the frame that carried this config is one, and arrives
+  // right behind it on the same socket).
+  state.waitingForKey = true;
   logLine('info', `解码器就绪 ${cfg.codec}`);
+}
+
+/** Rebuild the decoder from the last received config, at most 1×/second. */
+function rebuildDecoder() {
+  if (!state.lastConfig) return false;
+  if (performance.now() - (state.lastDecoderBuildAt ?? 0) < 1000) return false;
+  configureDecoder(state.lastConfig);
+  return state.decoder?.state === 'configured';
 }
 
 function teardownDecoder() {
@@ -783,7 +808,12 @@ function handleVideo(buf) {
     const el = $('#hudLatency');
     if (el) el.textContent = fmtMs(state.lastOneWayMs);
   }
-  if (!state.decoder || state.decoder.state !== 'configured') return;
+  if (!state.decoder || state.decoder.state !== 'configured') {
+    // Never sit on a dead decoder dropping frames forever: rebuild from
+    // the last config and let the next keyframe restart the picture.
+    rebuildDecoder();
+    return;
+  }
   // Drop instead of queueing when the decoder is already behind: decoding
   // every frame while the queue grows turns a brief network hiccup into
   // seconds of stale video. Interactive remote desktop prefers the newest

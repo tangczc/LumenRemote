@@ -64,3 +64,22 @@ export interface AvcStreamConfig extends ParameterSets {
 export function describeStream(sps: Buffer, pps: Buffer): AvcStreamConfig {
   return { sps, pps, avcC: buildAvcC(sps, pps), codec: codecString(sps) };
 }
+
+/**
+ * The config a stream needs now, or null when it matches `current`.
+ *
+ * Parameter sets change mid-session whenever the host encoder restarts at
+ * a different size (window resize, fullscreen, display switch) — and the
+ * RFC6381 codec string does NOT change with resolution, so anything keyed
+ * on the codec string alone keeps decoding new-size frames with the old
+ * SPS and wedges. Comparing the full avcC catches every real change.
+ */
+export function streamConfigChanged(
+  current: AvcStreamConfig | null,
+  sps: Buffer,
+  pps: Buffer,
+): AvcStreamConfig | null {
+  const next = describeStream(sps, pps);
+  if (current && current.avcC.equals(next.avcC)) return null;
+  return next;
+}
