@@ -334,6 +334,19 @@ let adaptedBitrateKbps = 0;
  */
 let bitrateStarved = false;
 let lastBitrateAdaptAt = 0;
+/** Since when the congestion verdict has continuously justified a recovery. */
+let pendingRecoverAt = 0;
+/** Last congestion verdict seen (bps), re-run by the stats heartbeat. */
+let lastVerdictBps = 0;
+/**
+ * Input-path counters for the stats heartbeat. Three checkpoints —
+ * controller UI sent / host received / host injected — let one log
+ * export say exactly where a dead click stopped travelling.
+ */
+let inputReceived = 0;
+let inputClicksReceived = 0;
+let inputForwarded = 0;
+let inputClicksForwarded = 0;
 /** Pending mid-session resize from the controller, debounced before the encoder restarts. */
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 /**
@@ -558,9 +571,16 @@ function aimInjector(): void {
   if (!active || active.role !== 'host') return;
   const sel = hostDisplays[active.displayIndex];
   if (!sel) return;
+  const virtual = virtualBounds(hostDisplays);
   injector.setTarget(
     { x: sel.x, y: sel.y, width: sel.width, height: sel.height },
-    virtualBounds(hostDisplays),
+    virtual,
+  );
+  // Logged on every (re)aim so a post-mortem export shows which
+  // geometry pointer mapping was actually using at the time.
+  log(
+    'info',
+    `鼠标注入瞄准 屏幕 ${sel.index + 1} ${sel.width}x${sel.height}@${sel.x},${sel.y} · 虚拟桌面 ${virtual.width}x${virtual.height}@${virtual.x},${virtual.y} · 共 ${hostDisplays.length} 块屏`,
   );
 }
 
@@ -1185,10 +1205,82 @@ async function startSession(
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
   bitrateStarved = false;
   lastBitrateAdaptAt = 0;
+  pendingRecoverAt = 0;
+  lastVerdictBps = 0;
+  inputReceived = 0;
+  inputClicksReceived = 0;
+  inputForwarded = 0;
+  inputClicksForwarded = 0;
   if (resizeTimer) {
     clearTimeout(resizeTimer);
     resizeTimer = null;
   }
+
+  // Feed the congestion verdict back into the encoder (debounced, and
+  // only on a material change): pacing alone cannot fix an encoder that
+  // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
+  // No encoder yet (path still probing) is not a reason to drop the
+  // verdict: record it, and startEncoder picks it up when it starts.
+  const applyVerdict = (bps: number): void => {
+    if (!active || active.role !== 'host') return;
+    const now = Date.now();
+    const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
+    // Judge the verdict against what the encoder can actually run at:
+    // the preset (or relay) cap. The wire verdict swings far above it
+    // on a probing link (4.6M -> 18.6M -> 4.6M ...), and comparing /
+    // storing it raw restarted the encoder at the *same* capped rate
+    // over and over — 16 no-op restarts in one 8-minute session, each
+    // costing a stall plus a keyframe burst into a thin uplink.
+    const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+    const capped = Math.min(kbps, capKbps);
+    const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
+    // Wide hysteresis: restarting the encoder costs a pipeline stall
+    // plus a keyframe burst, so on a healthy-but-variable link the cure
+    // was worse than the disease — a visible freeze every few seconds.
+    // Only a deep, sustained mismatch (40%+) justifies the restart;
+    // the pacer absorbs anything smaller by dropping frames.
+    const drop = capped < current * 0.6;
+    const recover = adaptedBitrateKbps > 0 && capped > current * 1.5;
+    if (!drop && !recover) {
+      pendingRecoverAt = 0;
+      return;
+    }
+    // A recovery must be sustained, not a probe spike: the congestion
+    // target regularly leaps to the ceiling for a second or two while
+    // probing, then crashes back. Acting on the spike restarted the
+    // encoder (and rebuilt the peer's decoder at a new size) five
+    // times in half a minute — the visible stall right after the
+    // user asked for 4K. Drops stay immediate: protecting the link
+    // cannot wait, climbing back can.
+    if (recover && !drop) {
+      if (pendingRecoverAt === 0) {
+        pendingRecoverAt = now;
+        return;
+      }
+      if (now - pendingRecoverAt < 3000) return;
+    }
+    pendingRecoverAt = 0;
+    // Recoveries may land every 3 s: the old flat 8 s cadence meant a
+    // 4K stream spent its first half-minute climbing 2.4M -> 45M in
+    // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
+    // Drops keep the calm 8 s cadence — that direction is the one
+    // that thrashes on a variable link.
+    if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
+    lastBitrateAdaptAt = now;
+    // Recover in steps, not in one leap to the (probing) verdict: a
+    // 1.5x step that the link cannot hold is absorbed by the pacer
+    // inside the hysteresis band instead of crashing straight back
+    // down and restarting the encoder again.
+    adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
+    if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
+    if (drop) bitrateStarved = true;
+    if (capped >= capKbps * 0.6) bitrateStarved = false;
+    log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
+    if (active.encoder) {
+      active.encoder.stop();
+      startEncoder(active);
+    }
+  };
 
   const session = new Session({
     role,
@@ -1198,7 +1290,11 @@ async function startSession(
     initialBitrateBps: Math.min(preset.netKbps * 1000, START_NET_BPS),
     maxBitrateBps: preset.netKbps * 1000,
     logger: logger.child('session'),
-    onInput: (event) => injector.inject(event),
+    onInput: (event) => {
+      inputReceived++;
+      if (event.k === 'mb' && event.down) inputClicksReceived++;
+      injector.inject(event);
+    },
     onFrame: (frame) => onIncomingFrame(frame),
     onControl: (ctl) => {
       lastPeerAt = Date.now();
@@ -1278,6 +1374,16 @@ async function startSession(
               await releasePanel('（主控请求真4K）');
               if (!active || active.role !== 'host') return;
               hostDisplays = await listDisplays(preset.fps);
+              log('info', `恢复原生后面板：${hostDisplays.map(displayLabel).join(' · ')}（共 ${hostDisplays.length} 块屏）`);
+              // Re-aim the injector at the restored panel: absolute
+              // pointer mapping runs through the display rectangle, and
+              // the restore just changed it (2560x1440 -> 3840x2160,
+              // with the other panels shifting inside the virtual
+              // desktop). Skipping this left every click landing in a
+              // compressed top-left region — the controller looked
+              // completely dead, and switching quality back did not
+              // re-aim either, so only a reconnect recovered it.
+              aimInjector();
               startEncoder(active);
               sendDisplayList();
             })();
@@ -1303,6 +1409,13 @@ async function startSession(
     },
     onStats: (s) => {
       sendUi({ type: 'stats', stats: toDto(s) });
+      // If a recovery has been continuously justified for 3 s but the
+      // verdict stopped moving (pinned at the ceiling), no further
+      // onBitrateChange arrives to execute it — re-run the last verdict
+      // from this heartbeat instead.
+      if (pendingRecoverAt > 0 && lastVerdictBps > 0 && Date.now() - pendingRecoverAt >= 3000) {
+        applyVerdict(lastVerdictBps);
+      }
       // A 10 s stats heartbeat in the log file is what makes "it stuttered
       // around 21:40" answerable after the fact: the live UI numbers are
       // gone the moment the session ends, the file keeps the whole curve.
@@ -1317,55 +1430,19 @@ async function startSession(
         `send=${(s.sendBps / 1e6).toFixed(2)}M recv=${(s.recvBps / 1e6).toFixed(2)}M ` +
         `queue=${s.queueBytes}B pending=${s.pendingFrames} drop=${s.droppedFrames} skip=${s.skippedFrames} ` +
         `fec=${s.recoveredFrames} rxpkts=${s.packetsReceived} authfail=${s.authFailures}`;
+      // Input checkpoints (see counters above): a dead-click report is
+      // answerable by comparing clicksSent (controller) with clicks
+      // (host) and injDrop — no more guessing which hop ate the input.
+      lastStatsLine +=
+        s.role === 'host'
+          ? ` in=${inputReceived} clicks=${inputClicksReceived} inj=${injector.running ? 'on' : 'off'} injDrop=${injector.droppedEvents}`
+          : ` inSent=${inputForwarded} clicksSent=${inputClicksForwarded}`;
       logger.info('stats', lastStatsLine);
     },
     onBitrateChange: (bps) => {
       log('info', `目标码率 ${(bps / 1000).toFixed(0)} kbps`);
-      // Feed the congestion verdict back into the encoder (debounced, and
-      // only on a material change): pacing alone cannot fix an encoder that
-      // produces 12 Mbps into a 5 Mbps uplink — it can only drop the excess.
-      // No encoder yet (path still probing) is not a reason to drop the
-      // verdict: record it, and startEncoder picks it up when it starts.
-      if (!active || active.role !== 'host') return;
-      const now = Date.now();
-      const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
-      // Judge the verdict against what the encoder can actually run at:
-      // the preset (or relay) cap. The wire verdict swings far above it
-      // on a probing link (4.6M -> 18.6M -> 4.6M ...), and comparing /
-      // storing it raw restarted the encoder at the *same* capped rate
-      // over and over — 16 no-op restarts in one 8-minute session, each
-      // costing a stall plus a keyframe burst into a thin uplink.
-      const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
-      const capped = Math.min(kbps, capKbps);
-      const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
-      // Wide hysteresis: restarting the encoder costs a pipeline stall
-      // plus a keyframe burst, so on a healthy-but-variable link the cure
-      // was worse than the disease — a visible freeze every few seconds.
-      // Only a deep, sustained mismatch (40%+) justifies the restart;
-      // the pacer absorbs anything smaller by dropping frames.
-      const drop = capped < current * 0.6;
-      const recover = adaptedBitrateKbps > 0 && capped > current * 1.5;
-      if (!drop && !recover) return;
-      // Recoveries may land every 3 s: the old flat 8 s cadence meant a
-      // 4K stream spent its first half-minute climbing 2.4M -> 45M in
-      // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
-      // Drops keep the calm 8 s cadence — that direction is the one
-      // that thrashes on a variable link.
-      if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
-      lastBitrateAdaptAt = now;
-      // Recover in steps, not in one leap to the (probing) verdict: a
-      // 1.5x step that the link cannot hold is absorbed by the pacer
-      // inside the hysteresis band instead of crashing straight back
-      // down and restarting the encoder again.
-      adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
-      if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
-      if (drop) bitrateStarved = true;
-      if (capped >= capKbps * 0.6) bitrateStarved = false;
-      log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
-      if (active.encoder) {
-        active.encoder.stop();
-        startEncoder(active);
-      }
+      lastVerdictBps = bps;
+      applyVerdict(bps);
     },
   });
   session.start();
@@ -1594,7 +1671,11 @@ function handleUi(msg: UiToApp): void {
       }
       break;
     case 'input':
-      if (active?.role === 'controller' && isInputEvent(msg.event)) active.session.sendInput(msg.event);
+      if (active?.role === 'controller' && isInputEvent(msg.event)) {
+        inputForwarded++;
+        if (msg.event.k === 'mb' && msg.event.down) inputClicksForwarded++;
+        active.session.sendInput(msg.event);
+      }
       break;
     case 'set-allow':
       state = { ...state, allowRemote: msg.enabled };

@@ -806,6 +806,7 @@ function onDecodedFrame(frame) {
 }
 
 let lastHudRes = '';
+let lastFrameHeartbeatAt = 0;
 function drawFrame(frame) {
   if (!frame) return;
   const canvas = $('#screen');
@@ -827,6 +828,14 @@ function drawFrame(frame) {
   ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
   frame.close();
   state.decodedFrames++;
+  // Display-side heartbeat: distinguishes "clicks injected but the
+  // picture here is frozen" from "clicks never arrived" — the network
+  // stats cannot tell those apart, this counter can.
+  const nowMs = performance.now();
+  if (nowMs - lastFrameHeartbeatAt > 10000) {
+    lastFrameHeartbeatAt = nowMs;
+    logLine('info', `画面心跳：已显示 ${state.decodedFrames} 帧 · 流分辨率 ${canvas.width}x${canvas.height}`);
+  }
   $('#stage').dataset.video = 'ready';
   if (!$('#stageOverlay').hidden) $('#stageOverlay').hidden = true;
 }
@@ -1037,11 +1046,20 @@ function setupStageInput() {
     // order. Pointer lock is deliberately not requested on click: switching
     // to relative motion mid-session makes every subsequent click land at an
     // offset the user cannot see. Double-click toggles it for gaming.
+    let clickPos = null;
     if (document.pointerLockElement !== stage) {
-      const pos = absoluteFromEvent(ev);
-      if (pos) send({ type: 'input', event: { k: 'ma', nx: pos.nx, ny: pos.ny } });
+      clickPos = absoluteFromEvent(ev);
+      if (clickPos) send({ type: 'input', event: { k: 'ma', nx: clickPos.nx, ny: clickPos.ny } });
     }
     send({ type: 'input', event: { k: 'mb', b: wireButton(ev.button), down: true } });
+    // One line per click at the source: the frame coordinates it was
+    // sent with and the frame size they were computed against. The
+    // host logs the same click arriving and being injected, so an
+    // exported log pair shows exactly where a dead click stopped.
+    logLine(
+      'info',
+      `点击发送 b=${wireButton(ev.button)} · 帧坐标 ${clickPos ? `${clickPos.nx},${clickPos.ny}` : '(指针锁定)'} · 画布 ${canvas.width}x${canvas.height} · 流分辨率 ${lastHudRes || '?'}`,
+    );
     ev.preventDefault();
   });
 
