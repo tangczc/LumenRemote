@@ -17,7 +17,7 @@ import { deriveAccessCode, generateAccessCode } from './access-code.ts';
 import { Codec, FrameFlags } from '../protocol/constants.ts';
 import type { InputEvent } from '../protocol/messages.ts';
 import { splitAnnexB } from '../media/nal.ts';
-import { annexBToAvcc, describeStream, type AvcStreamConfig } from '../media/avc.ts';
+import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
 import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
 import { negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
@@ -733,12 +733,18 @@ function startEncoder(target: ActiveSession): void {
 function onIncomingFrame(frame: IncomingFrame): void {
   if (!active || active.role !== 'controller') return;
   const units = splitAnnexB(frame.payload);
-  if (!avcConfig) {
-    const sps = units.find((u) => u.type === 7);
-    const pps = units.find((u) => u.type === 8);
-    if (sps && pps) {
-      avcConfig = describeStream(Buffer.from(sps.data), Buffer.from(pps.data));
-      sendUi({ type: 'config', codec: avcConfig.codec, avcC: avcConfig.avcC.toString('base64') });
+  // Re-derive the config from every parameter set seen, not just the
+  // first: a mid-session encoder restart at a new size brings a new SPS,
+  // and a controller still holding the first config decodes garbage (or
+  // errors out and never recovers, because no new config ever arrives).
+  const sps = units.find((u) => u.type === 7);
+  const pps = units.find((u) => u.type === 8);
+  if (sps && pps) {
+    const next = streamConfigChanged(avcConfig, Buffer.from(sps.data), Buffer.from(pps.data));
+    if (next) {
+      if (avcConfig) log('info', `视频参数变化（编码器换尺寸重启），已通知界面重建解码器 ${next.codec}`);
+      avcConfig = next;
+      sendUi({ type: 'config', codec: next.codec, avcC: next.avcC.toString('base64') });
     }
   }
   if (!avcConfig || !decodeInUi) return;
