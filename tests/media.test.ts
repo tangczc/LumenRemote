@@ -2,8 +2,9 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '../src/media/nal.ts';
 import { annexBToAvcc, buildAvcC, codecString, extractParameterSets, streamConfigChanged } from '../src/media/avc.ts';
+import { describeHevcStream, hevcCodecString, hevcStreamConfigChanged, parseHevcSps } from '../src/media/hevc.ts';
 import { capSizeForBitrate, fitGeometryForBitrate, negotiateSize, scaleBitrate } from '../src/media/target.ts';
-import { buildEncoderArgs } from '../src/media/encoder.ts';
+import { buildEncoderArgs, ScreenEncoder, codecKindOf, hevcHardwareEncoder } from '../src/media/encoder.ts';
 
 /** Build a fake Annex-B stream: SPS, PPS, IDR slice(s), then P slices. */
 function nal(type: number, body: number[]): Buffer {
@@ -156,6 +157,170 @@ describe('avc configuration', () => {
     const out = annexBToAvcc(units);
     assert.equal(out.readUInt32BE(0), 4);
     assert.equal(out.readUInt32BE(4 + 4), 2);
+  });
+});
+
+/* ------------------------------------------------------------ HEVC ---- */
+
+/** Minimal bit writer for hand-building HEVC RBSPs. */
+class Bits {
+  private bits = '';
+  u(n: number, value: number): this {
+    this.bits += value.toString(2).padStart(n, '0').slice(-n);
+    return this;
+  }
+  ue(value: number): this {
+    const codeNum = value + 1;
+    const zeros = Math.floor(Math.log2(codeNum));
+    this.bits += '0'.repeat(zeros) + codeNum.toString(2);
+    return this;
+  }
+  bytes(): Buffer {
+    let b = this.bits + '1';
+    while (b.length % 8 !== 0) b += '0';
+    const out: number[] = [];
+    for (let i = 0; i < b.length; i += 8) out.push(parseInt(b.slice(i, i + 8), 2));
+    return Buffer.from(out);
+  }
+}
+
+/** An HEVC NAL unit: 2-byte header (type in bits 9..14) + payload. */
+function hnal(type: number, payload: number[]): Buffer {
+  return Buffer.from([(type << 1) & 0x7e, 0x01, ...payload]);
+}
+
+/**
+ * A synthetic but structurally valid NVENC-style SPS: Main profile,
+ * level 4.0 (120), 2560x1440, 4:2:0 8-bit, no sub-layer PTL entries.
+ */
+function syntheticHevcSps(): Buffer {
+  const rbsp = new Bits()
+    .u(4, 0) // sps_video_parameter_set_id
+    .u(3, 0) // sps_max_sub_layers_minus1
+    .u(1, 1) // sps_temporal_id_nesting_flag
+    .u(2, 0) // profile_space
+    .u(1, 0) // tier_flag
+    .u(5, 1) // profile_idc = Main
+    .u(32, 0x4000_0000) // compatibility flags: flag[1]
+    .u(48, 0x9000_0000_0000) // constraint indicator: progressive + frame-only
+    .u(8, 120) // level_idc
+    .ue(0) // sps_seq_parameter_set_id
+    .ue(1) // chroma_format_idc = 4:2:0
+    .ue(2560)
+    .ue(1440)
+    .u(1, 0) // conformance_window_flag
+    .ue(0) // bit_depth_luma_minus8
+    .ue(0) // bit_depth_chroma_minus8
+    .bytes();
+  return Buffer.concat([Buffer.from([(33 << 1) & 0x7e, 0x01]), rbsp]);
+}
+
+describe('hevc configuration', () => {
+  test('parses a synthetic SPS and builds hvcC + codec string', () => {
+    const sps = syntheticHevcSps();
+    const info = parseHevcSps(sps);
+    assert.ok(info);
+    assert.equal(info.profileIdc, 1);
+    assert.equal(info.tier, false);
+    assert.equal(info.levelIdc, 120);
+    assert.equal(info.compatFlags, 0x4000_0000);
+    assert.equal(info.width, 2560);
+    assert.equal(info.height, 1440);
+    assert.equal(info.chromaFormatIdc, 1);
+    assert.equal(info.bitDepthLumaMinus8, 0);
+    // compat byte 0x40 bit-reversed is 0x02; the constraint bytes keep
+    // only their non-zero tail (0x90 = progressive, frame-only).
+    assert.equal(hevcCodecString(info), 'hvc1.1.2.L120.90');
+
+    const vps = hnal(32, [0x0c, 0x01]);
+    const pps = hnal(34, [0xc0, 0x72]);
+    const cfg = describeHevcStream(vps, sps, pps);
+    assert.ok(cfg);
+    assert.equal(cfg.codec, 'hvc1.1.2.L120.90');
+    assert.equal(cfg.hvcC[0], 1); // configurationVersion
+    assert.equal(cfg.hvcC[1], 1); // profileSpace(0) tier(0) profileIdc(1)
+    assert.equal(cfg.hvcC.readUInt32BE(2), 0x4000_0000);
+    assert.equal(cfg.hvcC[12], 120); // level
+    assert.equal(cfg.hvcC[16], 0xfc | 1); // chroma format
+    assert.equal(cfg.hvcC[22], 3); // numOfArrays
+    assert.equal(cfg.hvcC[23], 0x80 | 32); // first array: VPS
+    assert.equal(cfg.hvcC.readUInt16BE(26), vps.length);
+  });
+
+  test('rejects garbage instead of inventing a decoder config', () => {
+    assert.equal(parseHevcSps(Buffer.from([0x42, 0x01, 0x00])), null);
+    assert.equal(parseHevcSps(Buffer.from([0x40, 0x01, 0xff, 0xff, 0xff])), null); // wrong type (32)
+    assert.equal(describeHevcStream(hnal(32, [1]), Buffer.from([0x42, 0x01, 0x00]), hnal(34, [1])), null);
+  });
+
+  test('config change detection keys on the full record', () => {
+    const vps = hnal(32, [0x0c, 0x01]);
+    const pps = hnal(34, [0xc0, 0x72]);
+    const first = describeHevcStream(vps, syntheticHevcSps(), pps);
+    assert.ok(first);
+    assert.equal(hevcStreamConfigChanged({ hvcC: first.hvcC }, vps, syntheticHevcSps(), pps), null);
+  });
+
+  test('assembles HEVC access units on first-slice-segment boundaries', () => {
+    const aus: import('../src/media/nal.ts').AccessUnit[] = [];
+    const assembler = new AccessUnitAssembler((a) => aus.push(a), 'hevc');
+    const stream = Buffer.concat([
+      joinAnnexB([
+        { type: 32, data: hnal(32, [0x0c]) },
+        { type: 33, data: syntheticHevcSps() },
+        { type: 34, data: hnal(34, [0xc0]) },
+        { type: 19, data: hnal(19, [0x80, 0x11]) }, // IDR, first slice segment
+      ]),
+      joinAnnexB([{ type: 1, data: hnal(1, [0x80, 0x22]) }]), // TRAIL, first segment
+      joinAnnexB([
+        { type: 1, data: hnal(1, [0x80, 0x33]) }, // TRAIL, first segment
+        { type: 1, data: hnal(1, [0x00, 0x44]) }, // same picture, later segment
+      ]),
+    ]);
+    assembler.push(stream);
+    assembler.flush();
+    assert.equal(aus.length, 3);
+    assert.equal(aus[0]!.isKey, true);
+    assert.equal(aus[0]!.hasVps, true);
+    assert.equal(aus[0]!.hasSps, true);
+    assert.equal(aus[1]!.isKey, false);
+    assert.equal(aus[2]!.units.length, 2, 'later slice segments stay with their picture');
+  });
+
+  test('splits HEVC annex-b with HEVC type numbering', () => {
+    const units = splitAnnexB(
+      Buffer.concat([Buffer.from([0, 0, 0, 1]), hnal(33, [0x99]), Buffer.from([0, 0, 1]), hnal(1, [0x80])]),
+      'hevc',
+    );
+    assert.deepEqual(
+      units.map((u) => u.type),
+      [33, 1],
+    );
+  });
+
+  test('hevc encoder args use the hardware HEVC path and raw HEVC output', () => {
+    const args = buildEncoderArgs({
+      source: { kind: 'screen', mode: 'gdi' },
+      encoder: 'hevc_nvenc',
+      onAccessUnit: () => {},
+    });
+    assert.equal(args[args.indexOf('-c:v') + 1], 'hevc_nvenc');
+    assert.equal(args[args.indexOf('-preset') + 1], 'p4');
+    // The output format is the LAST -f (the gdigrab input has one too).
+    assert.equal(args[args.lastIndexOf('-f') + 1], 'hevc');
+    assert.equal(codecKindOf({ encoder: 'hevc_qsv' }), 'hevc');
+    assert.equal(codecKindOf({ encoder: 'h264_nvenc' }), 'h264');
+    assert.equal(codecKindOf({ encoder: 'auto', codec: 'hevc' }), 'hevc');
+    const enc = new ScreenEncoder({
+      source: { kind: 'test', size: '320x240' },
+      encoder: 'hevc_nvenc',
+      onAccessUnit: () => {},
+    });
+    assert.equal(enc.codecKind, 'hevc');
+  });
+
+  test('no hardware HEVC encoder is reported when ffmpeg is missing', () => {
+    assert.equal(hevcHardwareEncoder('/nonexistent/definitely-no-ffmpeg'), null);
   });
 });
 
@@ -357,5 +522,31 @@ describe('encode size negotiation', () => {
     const scaled = buildEncoderArgs({ ...base, targetSize: { width: 1920, height: 1080 } });
     const vf = scaled[scaled.indexOf('-vf') + 1];
     assert.equal(vf, 'scale=1920:1080:flags=fast_bilinear');
+  });
+
+  test('encoder reports not-running after its process exits', { timeout: 15000 }, async () => {
+    // Regression: `running` used to stay true forever after a crash
+    // (the dead ChildProcess was never cleared), which disabled every
+    // revive path in the app — one session kept a frozen picture for
+    // a minute after a 4 s desktop denial because the "restart when
+    // the desktop returns" check could never fire.
+    const exited = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('encoder never exited')), 10000);
+      const enc = new ScreenEncoder({
+        source: { kind: 'test', size: '320x240' },
+        fps: 10,
+        bitrateKbps: 400,
+        encoder: 'libx264',
+        ffmpegPath: process.platform === 'win32' ? 'Z:\\nonexistent\\ffmpeg.exe' : '/bin/false',
+        onAccessUnit: () => {},
+        onExit: () => {
+          clearTimeout(timer);
+          assert.equal(enc.running, false);
+          resolve();
+        },
+      });
+      enc.start();
+    });
+    await exited;
   });
 });

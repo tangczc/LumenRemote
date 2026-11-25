@@ -56,8 +56,21 @@ export type ControlMessage =
   | { t: 'nack'; entries: NackEntry[] }
   | { t: 'idr' }
   | { t: 'bitrate'; bps: number }
-  /** Controller viewport changed mid-session (resize / fullscreen): re-encode at a size that fits it. */
-  | { t: 'resize'; width: number; height: number; fps?: number }
+  /**
+   * Controller viewport changed mid-session (resize / fullscreen): re-encode
+   * at a size that fits it. `codecs` rides along (in preference order, e.g.
+   * ['hevc', 'h264']) so the host learns what the controller can actually
+   * decode before it picks an encoder — H.265 is only worth emitting when
+   * the far end has a hardware decoder for it.
+   */
+  | { t: 'resize'; width: number; height: number; fps?: number; codecs?: string[] }
+  /**
+   * Controller -> host: pin the video codec. Sent when the controller's
+   * decoder turns out not to support what the host is emitting (the
+   * capability probe is best-effort); the host restarts its encoder in
+   * the requested family and stays there for the session.
+   */
+  | { t: 'codec'; codec: 'h264' | 'hevc' }
   | { t: 'ping'; n: number; t1: number }
   | { t: 'pong'; n: number; t1: number; t2: number; t3: number }
   /** Host -> controller: the host's displays and which one is being captured. */
@@ -69,9 +82,12 @@ export type ControlMessage =
    * QUALITY_PRESETS, validated by the receiver). Quality used to be a
    * per-device local setting only, so a controller picking 游戏/4K
    * changed nothing on the host, which kept encoding at its own
-   * saved (usually 30 fps) preset.
+   * saved (usually 30 fps) preset. `fps` / `bitrateKbps` are
+   * session-scoped overrides on top of the preset (UU-style tiers:
+   * 原画 30M is a bitrate choice, frame rate is picked independently);
+   * absent or 0 means "the preset's own value".
    */
-  | { t: 'quality'; preset: string }
+  | { t: 'quality'; preset: string; fps?: number; bitrateKbps?: number }
   /**
    * Controller -> host: run a 15 s link probe. The host encodes a
    * full-motion test pattern at a fixed high bitrate with every

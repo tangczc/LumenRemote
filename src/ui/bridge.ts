@@ -45,10 +45,18 @@ export type UiToApp =
   | { type: 'decline'; sessionId: string; reason?: string }
   | { type: 'connect'; code: string; password?: string }
   | { type: 'disconnect' }
-  | { type: 'quality'; preset: QualityPreset }
+  /** Session quality pick. fps/bitrateKbps optionally override the preset for this session (UU-style bitrate tiers + independent frame rate); they are never persisted as the device default. */
+  | { type: 'quality'; preset: QualityPreset; fps?: number; bitrateKbps?: number }
   | { type: 'keyframe' }
   | { type: 'probe' }
-  | { type: 'client-display'; width: number; height: number; fps?: number }
+  /**
+   * The UI's stage size, plus the video codecs this UI can decode in
+   * preference order (probed via WebCodecs). The app forwards the list
+   * to the host, which only negotiates H.265 when 'hevc' appears here.
+   */
+  | { type: 'client-display'; width: number; height: number; fps?: number; codecs?: string[] }
+  /** The UI could not configure a decoder for the stream it is receiving (e.g. no HEVC hardware decode): ask the host to fall back to H.264. */
+  | { type: 'codec-fallback' }
   | { type: 'input'; event: unknown }
   | { type: 'set-allow'; enabled: boolean }
   | { type: 'set-handover'; enabled: boolean }
@@ -109,7 +117,8 @@ export type AppToUi =
       route: string;
       display?: { width: number; height: number; fps: number };
     }
-  | { type: 'config'; codec: string; avcC: string }
+  /** Decoder configuration for the incoming stream: RFC 6381 codec string plus the base64 codec-specific record (avcC for H.264, hvcC for H.265). */
+  | { type: 'config'; codec: string; description: string }
   | { type: 'stats'; stats: SessionStatsDto }
   | { type: 'session-route'; route: 'p2p' | 'relay' }
   | { type: 'session-end'; reason: string }

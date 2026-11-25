@@ -239,6 +239,21 @@ describe('control messages', () => {
     assert.deepEqual(decodeControl(encodeControl(msg)), msg);
   });
 
+  test('quality control carries UU-style fps/bitrate session overrides', () => {
+    const msg = { t: 'quality' as const, preset: 'game', fps: 90, bitrateKbps: 30000 };
+    assert.deepEqual(decodeControl(encodeControl(msg)), msg);
+  });
+
+  test('codec control roundtrip (controller pins the video codec)', () => {
+    const msg = { t: 'codec' as const, codec: 'h264' as const };
+    assert.deepEqual(decodeControl(encodeControl(msg)), msg);
+  });
+
+  test('resize control carries decode capabilities for codec negotiation', () => {
+    const msg = { t: 'resize' as const, width: 1920, height: 1080, fps: 60, codecs: ['hevc', 'h264'] };
+    assert.deepEqual(decodeControl(encodeControl(msg)), msg);
+  });
+
   test('input roundtrip and garbage rejection', () => {
     const ev = { k: 'mm' as const, dx: 12, dy: -3 };
     assert.deepEqual(decodeInput(encodeInput(ev)), ev);

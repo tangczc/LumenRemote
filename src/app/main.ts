@@ -16,9 +16,10 @@ import { randomBytes, createHmac } from 'node:crypto';
 import { deriveAccessCode, generateAccessCode } from './access-code.ts';
 import { Codec, FrameFlags } from '../protocol/constants.ts';
 import type { InputEvent } from '../protocol/messages.ts';
-import { splitAnnexB } from '../media/nal.ts';
-import { annexBToAvcc, streamConfigChanged, type AvcStreamConfig } from '../media/avc.ts';
-import { ScreenEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
+import { splitAnnexB, type VideoCodecKind } from '../media/nal.ts';
+import { annexBToAvcc, streamConfigChanged } from '../media/avc.ts';
+import { extractHevcParameterSets, hevcStreamConfigChanged } from '../media/hevc.ts';
+import { ScreenEncoder, hevcHardwareEncoder, resolveEncoder, type EncoderName } from '../media/encoder.ts';
 import { fitGeometryForBitrate, negotiateSize, scaleBitrate, type SizeRequest } from '../media/target.ts';
 import { InputInjector } from '../host/injector.ts';
 import { SecureDesktopMonitor } from '../host/secure-desktop.ts';
@@ -381,10 +382,44 @@ let foregroundMonitor: ForegroundMonitor | null = null;
 /** Periodic re-enumeration of the host's displays during a session. */
 let displayWatchTimer: ReturnType<typeof setInterval> | null = null;
 let displayWatchBusy = false;
+/** Periodic check that the host encoder is actually alive. */
+let encoderWatchTimer: ReturnType<typeof setInterval> | null = null;
 /** Encoder crashes absorbed in the current session, so a broken capture cannot loop. */
 let autoRestarts = 0;
-let avcConfig: AvcStreamConfig | null = null;
+/**
+ * Decoder configuration of the stream we are receiving, in whichever
+ * codec family the host negotiated. The UI gets `codec` (RFC 6381) plus
+ * the raw configuration record (avcC or hvcC) as `description`.
+ */
+let streamConfig: { family: VideoCodecKind; codec: string; description: Buffer } | null = null;
 const decodeInUi = values.display === 'ui';
+/**
+ * Video codecs the peer UI can decode, in its preference order, learned
+ * from its resize messages. H.265 is only encoded when 'hevc' is listed
+ * AND this host has a hardware HEVC encoder.
+ */
+let peerVideoCodecs: string[] = ['h264'];
+/** Set when the peer's decoder rejected HEVC mid-session: stay on H.264. */
+let peerCodecLock: 'h264' | null = null;
+/**
+ * Session-scoped quality overrides from the controller's UU-style
+ * picker (bitrate tier + independent frame rate). 0 = follow the
+ * preset. Never persisted: the device default stays the preset.
+ */
+let sessionFps = 0;
+let sessionBitrateKbps = 0;
+
+function effectiveFps(): number {
+  return sessionFps > 0 ? sessionFps : preset.fps;
+}
+
+function effectiveBitrateKbps(): number {
+  return sessionBitrateKbps > 0 ? sessionBitrateKbps : preset.bitrateKbps;
+}
+/** Video codecs THIS device's UI can decode (reported by the renderer). */
+let uiVideoCodecs: string[] = ['h264'];
+/** Codec family of the currently running host encoder. */
+let encoderFamily: VideoCodecKind = 'h264';
 
 logger.info(
   'app',
@@ -692,6 +727,38 @@ function startForegroundMonitor(): void {
  * silently invalidated all of it until the next reconnect. Re-enumerate
  * periodically and re-aim everything at the new layout.
  */
+/**
+ * Revive a dead encoder during a host session, whatever killed it.
+ * Capture death has many transient causes — UAC secure desktops,
+ * display-mode switches by games, GPU driver resets, another app
+ * holding Desktop Duplication — and the previous design's recovery
+ * depended on noticing each cause individually; when one slipped
+ * through (a 4 s desktop denial burned the fast-retry budget, and a
+ * broken `running` flag blocked the desktop monitor's revive), the
+ * session stayed black for a minute while input kept working. A
+ * watchdog that simply asks "is the encoder alive?" every 5 s and
+ * restarts it if not covers the whole class.
+ */
+function startEncoderWatchdog(): void {
+  stopEncoderWatchdog();
+  encoderWatchTimer = setInterval(() => {
+    if (!active || active.role !== 'host') return;
+    if (secureDesktop.active) return; // capture is supposed to be down
+    if (!active.encoder || !active.encoder.running) {
+      log('warn', '看门狗：编码器不在运行，尝试恢复采集');
+      // Fast retries stay exhausted so a persistent denial costs one
+      // spawn per watchdog tick, not a 4-spawn burst every 5 s.
+      autoRestarts = 3;
+      startEncoder(active);
+    }
+  }, 5000);
+}
+
+function stopEncoderWatchdog(): void {
+  if (encoderWatchTimer) clearInterval(encoderWatchTimer);
+  encoderWatchTimer = null;
+}
+
 function startDisplayWatcher(): void {
   stopDisplayWatcher();
   displayWatchTimer = setInterval(() => {
@@ -760,7 +827,33 @@ async function switchDisplay(index: number): Promise<void> {
   sendDisplayList();
 }
 
+/**
+ * The codec family the next encoder should emit. H.265 wherever it is
+ * actually usable — the peer's UI must be able to hardware-decode it
+ * and this host must have a hardware HEVC encoder. Commercial tools
+ * (UU) stream HEVC for a reason: at the same bitrate it carries
+ * visibly more picture, which is exactly the gap reported against
+ * them at equal latency/fps. An explicit --encoder name always wins
+ * over negotiation.
+ */
+function desiredEncoderFamily(): { family: VideoCodecKind; explicit: EncoderName | 'auto' } {
+  const explicit = values.encoder as EncoderName | 'auto';
+  if (explicit !== 'auto') {
+    return { family: explicit === 'libx265' || explicit.startsWith('hevc') ? 'hevc' : 'h264', explicit };
+  }
+  if (peerCodecLock === 'h264') return { family: 'h264', explicit };
+  if (peerVideoCodecs.includes('hevc') && hevcHardwareEncoder(ffmpegBinary())) {
+    return { family: 'hevc', explicit };
+  }
+  return { family: 'h264', explicit };
+}
+
 function startEncoder(target: ActiveSession): void {
+  // Never leave an unowned encoder behind: several callers stop the
+  // old one first, but the watchdog can interleave with an async
+  // display transition and start one the transition does not know
+  // about. Stopping here is cheap insurance against a leak.
+  if (target.encoder && target.encoder.running) target.encoder.stop();
   // Frames queued for the previous encoder belong to a reference chain that the
   // new keyframe replaces; sending them only delays the useful picture.
   target.session.discardPendingMedia();
@@ -775,8 +868,16 @@ function startEncoder(target: ActiveSession): void {
   const negotiated = negotiateSize(capture, peerDisplay);
   let { width, height } = negotiated;
   let scaled = negotiated.scaled;
-  let fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
-  const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+  let fps = relayBudget ? Math.min(effectiveFps(), RELAY_FPS) : effectiveFps();
+  // Asking a 60 Hz panel for 144 fps only encodes duplicates. Cap at
+  // the captured display's real refresh rate (UU's 144 option is only
+  // meaningful on high-refresh panels, and says so by its hardware).
+  const panelHz = sel?.refreshRate ?? 0;
+  if (panelHz > 0 && fps > panelHz) {
+    log('info', `请求帧率 ${fps} 超过面板刷新率 ${panelHz} Hz，按 ${panelHz} 执行`);
+    fps = panelHz;
+  }
+  const presetKbps = relayBudget ? Math.min(effectiveBitrateKbps(), RELAY_NET_KBPS) : effectiveBitrateKbps();
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
   // encoder produce faster than the path has proven it can carry. Without
@@ -848,6 +949,12 @@ function startEncoder(target: ActiveSession): void {
     fps,
     context: `${negotiated.width}x${negotiated.height}@${relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps}`,
   };
+  const { family, explicit: explicitEncoder } = desiredEncoderFamily();
+  if (family === 'h264' && explicitEncoder === 'auto' && peerCodecLock !== 'h264' && peerVideoCodecs.includes('hevc')) {
+    log('info', '主控支持 H.265 解码，但本机无 HEVC 硬件编码器，继续使用 H.264');
+  }
+  encoderFamily = family;
+
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source:
@@ -863,7 +970,8 @@ function startEncoder(target: ActiveSession): void {
     fps,
     bitrateKbps,
     targetSize: scaled ? { width, height } : undefined,
-    encoder: values.encoder as EncoderName | 'auto',
+    encoder: explicitEncoder,
+    codec: family,
     ffmpegPath: ffmpegBinary(),
     onAccessUnit: (au) => {
       if (!active || active.role !== 'host') return;
@@ -871,7 +979,11 @@ function startEncoder(target: ActiveSession): void {
       // a reference chain the replacement already superseded.
       if (active.encoder && active.encoder !== self) return;
       try {
-        const sent = active.session.sendFrame(Codec.H264, au.isKey ? FrameFlags.Key : 0, au.payload);
+        const sent = active.session.sendFrame(
+          family === 'hevc' ? Codec.HEVC : Codec.H264,
+          au.isKey ? FrameFlags.Key : 0,
+          au.payload,
+        );
         // A shed frame breaks the reference chain, so the decoder would show
         // corruption until the next IDR. Ask for one instead of waiting — but
         // at most every 5 s: restarting the whole capture pipeline is itself
@@ -902,7 +1014,7 @@ function startEncoder(target: ActiveSession): void {
         return;
       }
       if (autoRestarts >= 3) {
-        log('error', '编码器多次异常退出，已停止自动重启（检查显卡驱动或是否有其他远控软件占用桌面复制）');
+        log('error', '编码器多次异常退出，暂停快速重启（看门狗将每 5 秒重试；或检查显卡驱动/是否有其他远控软件占用桌面复制）');
         return;
       }
       autoRestarts++;
@@ -921,31 +1033,56 @@ function startEncoder(target: ActiveSession): void {
   if (values.source !== 'test') {
     const mode = encoder.captureMode === 'dda' ? 'Desktop Duplication (GPU)' : 'GDI';
     const shape = scaled ? ` · 缩放输出 ${width}x${height} · ${bitrateKbps} kbps` : ` · ${bitrateKbps} kbps`;
+    const codecLabel = `${family === 'hevc' ? 'H.265' : 'H.264'}/${resolveEncoder(explicitEncoder, ffmpegBinary(), family)}`;
     log(
       'info',
-      `屏幕采集 ${mode} ${capture.width}x${capture.height}@${fps}${shape}${sel ? ` · ${displayLabel(sel)}` : ''}`,
+      `屏幕采集 ${mode} ${capture.width}x${capture.height}@${fps}${shape} · 编码 ${codecLabel}${sel ? ` · ${displayLabel(sel)}` : ''}`,
     );
   }
 }
 
 function onIncomingFrame(frame: IncomingFrame): void {
   if (!active || active.role !== 'controller') return;
-  const units = splitAnnexB(frame.payload);
+  const family: VideoCodecKind = frame.codec === Codec.HEVC ? 'hevc' : 'h264';
+  const units = splitAnnexB(frame.payload, family);
   // Re-derive the config from every parameter set seen, not just the
   // first: a mid-session encoder restart at a new size brings a new SPS,
   // and a controller still holding the first config decodes garbage (or
   // errors out and never recovers, because no new config ever arrives).
-  const sps = units.find((u) => u.type === 7);
-  const pps = units.find((u) => u.type === 8);
-  if (sps && pps) {
-    const next = streamConfigChanged(avcConfig, Buffer.from(sps.data), Buffer.from(pps.data));
-    if (next) {
-      if (avcConfig) log('info', `视频参数变化（编码器换尺寸重启），已通知界面重建解码器 ${next.codec}`);
-      avcConfig = next;
-      sendUi({ type: 'config', codec: next.codec, avcC: next.avcC.toString('base64') });
+  if (family === 'hevc') {
+    const sets = extractHevcParameterSets(units);
+    if (sets.vps && sets.sps && sets.pps) {
+      const current = streamConfig?.family === 'hevc' ? streamConfig : null;
+      const next = hevcStreamConfigChanged(current ? { hvcC: current.description } : null, sets.vps, sets.sps, sets.pps);
+      if (next) {
+        if (streamConfig) log('info', `视频参数变化（编码器换尺寸重启），已通知界面重建解码器 ${next.codec}`);
+        streamConfig = { family: 'hevc', codec: next.codec, description: next.hvcC };
+        sendUi({ type: 'config', codec: next.codec, description: next.hvcC.toString('base64') });
+      } else if (!streamConfig) {
+        // SPS we cannot parse into an hvcC: better to ask for H.264
+        // than to leave the UI staring at an unconfigurable stream.
+        log('warn', 'H.265 参数集无法解析，请求被控回退 H.264');
+        active.session.sendControl({ t: 'codec', codec: 'h264' });
+      }
+    }
+  } else {
+    const sps = units.find((u) => u.type === 7);
+    const pps = units.find((u) => u.type === 8);
+    if (sps && pps) {
+      const current = streamConfig?.family === 'h264' ? streamConfig : null;
+      const next = streamConfigChanged(
+        current ? { sps: Buffer.from(sps.data), pps: Buffer.from(pps.data), avcC: current.description, codec: current.codec } : null,
+        Buffer.from(sps.data),
+        Buffer.from(pps.data),
+      );
+      if (next) {
+        if (streamConfig) log('info', `视频参数变化（编码器换尺寸重启），已通知界面重建解码器 ${next.codec}`);
+        streamConfig = { family: 'h264', codec: next.codec, description: next.avcC };
+        sendUi({ type: 'config', codec: next.codec, description: next.avcC.toString('base64') });
+      }
     }
   }
-  if (!avcConfig || !decodeInUi) return;
+  if (!streamConfig || !decodeInUi) return;
   ui?.broadcastBinary(
     encodeVideoPacket({
       frameId: frame.frameId,
@@ -1162,7 +1299,11 @@ function endSession(reason: string): void {
   // so the second call must not repeat the log line or rotate a code twice.
   if (!current) return;
   active = null;
-  avcConfig = null;
+  streamConfig = null;
+  peerVideoCodecs = ['h264'];
+  peerCodecLock = null;
+  sessionFps = 0;
+  sessionBitrateKbps = 0;
   relayBudget = false;
   if (current) {
     current.cancelUpgrade?.();
@@ -1175,6 +1316,7 @@ function endSession(reason: string): void {
   foregroundMonitor?.stop();
   foregroundMonitor = null;
   stopDisplayWatcher();
+  stopEncoderWatchdog();
   if (probeTimer) {
     clearTimeout(probeTimer);
     probeTimer = null;
@@ -1383,6 +1525,8 @@ async function startSession(
   });
   autoRestarts = 0;
   bakeCursor = false;
+  sessionFps = 0;
+  sessionBitrateKbps = 0;
   // Seed the encoder at the slow-start rate too: an encoder producing the
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
@@ -1418,7 +1562,7 @@ async function startSession(
     // storing it raw restarted the encoder at the *same* capped rate
     // over and over — 16 no-op restarts in one 8-minute session, each
     // costing a stall plus a keyframe burst into a thin uplink.
-    const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+    const capKbps = relayBudget ? Math.min(effectiveBitrateKbps(), RELAY_NET_KBPS) : effectiveBitrateKbps();
     const capped = Math.min(kbps, capKbps);
     const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
     // Wide hysteresis: restarting the encoder costs a pipeline stall
@@ -1518,7 +1662,36 @@ async function startSession(
         }
         return;
       }
+      if (ctl.t === 'codec' && role === 'host' && active) {
+        // The peer's decoder rejected the negotiated codec (or its SPS
+        // would not parse): pin H.264 for the rest of the session.
+        // Idempotent — repeated requests change nothing.
+        if (ctl.codec === 'h264' && peerCodecLock !== 'h264') {
+          peerCodecLock = 'h264';
+          log('warn', '主控解码端不支持当前编码，已回退 H.264（本会话内不再尝试 H.265）');
+          if (encoderFamily !== 'h264' && active.encoder?.running) {
+            active.encoder.stop();
+            startEncoder(active);
+          }
+        }
+        return;
+      }
       if (ctl.t === 'resize' && role === 'host' && active) {
+        // Codec capabilities ride along with the viewport report. If
+        // they unlock (or revoke) H.265 relative to the running encoder,
+        // switch families once — one restart at negotiation time, not
+        // a mid-session surprise.
+        if (Array.isArray(ctl.codecs) && ctl.codecs.length > 0) {
+          const cleaned = ctl.codecs.filter((c) => c === 'hevc' || c === 'h264');
+          if (cleaned.length > 0 && cleaned.join(',') !== peerVideoCodecs.join(',')) {
+            peerVideoCodecs = cleaned;
+            if (active.encoder?.running && desiredEncoderFamily().family !== encoderFamily) {
+              log('info', `主控解码能力 ${cleaned.join('/')}，切换编码为 ${desiredEncoderFamily().family === 'hevc' ? 'H.265' : 'H.264'}`);
+              active.encoder.stop();
+              startEncoder(active);
+            }
+          }
+        }
         // The controller resized its window or entered/left fullscreen. The
         // encode size was previously fixed at connect time, so fullscreen
         // kept showing the small pre-fullscreen stream. Re-negotiate — but
@@ -1549,15 +1722,26 @@ async function startSession(
       if (ctl.t === 'quality' && role === 'host' && active) {
         // Session-scoped: the host owner's own saved default is left
         // untouched; this only steers the running encoder (and the log
-        // says why the fps/bitrate suddenly changed).
+        // says why the fps/bitrate suddenly changed). fps/bitrateKbps
+        // are the controller's UU-style tier overrides on top of the
+        // preset; a change to either alone must also take effect.
         const key = ctl.preset as QualityPreset;
         const p = QUALITY_PRESETS[key];
-        if (p && key !== presetKey) {
+        const newFps = ctl.fps && ctl.fps >= 10 && ctl.fps <= 240 ? Math.round(ctl.fps) : 0;
+        const newBitrateKbps =
+          ctl.bitrateKbps && ctl.bitrateKbps >= 1000 && ctl.bitrateKbps <= 60_000 ? Math.round(ctl.bitrateKbps) : 0;
+        const switchedPreset = key !== presetKey;
+        if (p && (switchedPreset || newFps !== sessionFps || newBitrateKbps !== sessionBitrateKbps)) {
           presetKey = key;
           preset = p;
-          active.session.setMaxBudget(qualityCeilingBps(p));
-          log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
-          if (key === 'uhd' && panelHold?.applied) {
+          sessionFps = newFps;
+          sessionBitrateKbps = newBitrateKbps;
+          active.session.setMaxBudget(effectiveCeilingBps());
+          log(
+            'info',
+            `主控请求画质 ${p.label} · ${effectiveFps()} fps · ${effectiveBitrateKbps()} kbps${newBitrateKbps ? '（会话码率覆盖）' : ''}`,
+          );
+          if (key === 'uhd' && switchedPreset && panelHold?.applied) {
             // The panel was taken over (switched down) at session start,
             // so the capture source itself is no longer 4K. Restore the
             // native mode before encoding, or the 4K stream is just an
@@ -1650,7 +1834,7 @@ async function startSession(
     role,
     deviceId: '',
     eph: eph.publicKeyRaw.toString('base64'),
-    caps: ['h264', 'webcodecs'],
+    caps: [...uiVideoCodecs, 'webcodecs'],
     display: { width: video.width, height: video.height, fps: preset.fps },
   });
 
@@ -1699,12 +1883,23 @@ async function startSession(
     startDesktopMonitor();
     startForegroundMonitor();
     startDisplayWatcher();
+    startEncoderWatchdog();
   }
 
   // The controller's quality choice drives the host's encoder; without
   // this the host only ever used its own saved preset (default 30 fps).
   if (role === 'controller') {
     session.sendControl({ t: 'quality', preset: presetKey });
+    // Report the viewport AND the decode capabilities immediately, so
+    // the host's first encoder (started during path selection above)
+    // already knows whether H.265 is on the table.
+    session.sendControl({
+      t: 'resize',
+      width: controllerSize.width,
+      height: controllerSize.height,
+      fps: effectiveFps(),
+      codecs: uiVideoCodecs,
+    });
   }
   sendUi({
     type: 'session-start',
@@ -1776,23 +1971,38 @@ function qualityCeilingBps(p: (typeof QUALITY_PRESETS)[QualityPreset]): number {
   return (relayBudget ? Math.min(p.netKbps, RELAY_NET_KBPS) : p.netKbps) * 1000;
 }
 
-function applyQuality(next: QualityPreset): void {
+/** Ceiling for the running session: a custom bitrate tier (UU's 原画 30M etc.) budgets its own network overhead instead of the preset's. */
+function effectiveCeilingBps(): number {
+  const netKbps = sessionBitrateKbps > 0 ? Math.round(sessionBitrateKbps * NET_OVERHEAD) : preset.netKbps;
+  return (relayBudget ? Math.min(netKbps, RELAY_NET_KBPS) : netKbps) * 1000;
+}
+
+function applyQuality(next: QualityPreset, fps = 0, bitrateKbps = 0): void {
   const p = QUALITY_PRESETS[next];
   if (!p) return;
   state = { ...state, quality: next };
   saveState(state);
   preset = p;
   presetKey = next;
-  if (active) active.session.setMaxBudget(qualityCeilingBps(p));
+  // Session-scoped tier overrides (UU-style): applied and forwarded,
+  // but only the preset itself becomes the saved device default.
+  sessionFps = fps >= 10 && fps <= 240 ? Math.round(fps) : 0;
+  sessionBitrateKbps = bitrateKbps >= 1000 && bitrateKbps <= 60_000 ? Math.round(bitrateKbps) : 0;
+  if (active) active.session.setMaxBudget(effectiveCeilingBps());
   if (active?.role === 'controller') {
-    active.session.sendControl({ t: 'quality', preset: next });
+    active.session.sendControl({
+      t: 'quality',
+      preset: next,
+      fps: sessionFps > 0 ? sessionFps : undefined,
+      bitrateKbps: sessionBitrateKbps > 0 ? sessionBitrateKbps : undefined,
+    });
   }
   if (active?.role === 'host' && active.encoder) {
     active.encoder.stop();
     startEncoder(active);
   }
   emitSettings();
-  log('info', `画质 ${p.label} · ${p.bitrateKbps} kbps`);
+  log('info', `画质 ${p.label} · ${effectiveFps()} fps · ${effectiveBitrateKbps()} kbps`);
 }
 
 /**
@@ -1841,7 +2051,7 @@ function handleUi(msg: UiToApp): void {
       }
       break;
     case 'quality':
-      applyQuality(msg.preset);
+      applyQuality(msg.preset, msg.fps ?? 0, msg.bitrateKbps ?? 0);
       break;
     case 'probe':
       if (active?.role === 'controller') active.session.sendControl({ t: 'probe' });
@@ -1860,6 +2070,10 @@ function handleUi(msg: UiToApp): void {
       }
       break;
     case 'client-display':
+      if (Array.isArray(msg.codecs) && msg.codecs.length > 0) {
+        const cleaned = msg.codecs.filter((c) => c === 'hevc' || c === 'h264');
+        if (cleaned.length > 0) uiVideoCodecs = cleaned;
+      }
       if (msg.width > 0 && msg.height > 0) {
         controllerSize = { width: Math.round(msg.width), height: Math.round(msg.height) };
         // Mid-session (window resize, entering/leaving fullscreen) the host
@@ -1868,8 +2082,23 @@ function handleUi(msg: UiToApp): void {
         // blurry picture. Previously this only updated a local variable
         // that nothing read until the NEXT connection.
         if (active?.role === 'controller') {
-          active.session.sendControl({ t: 'resize', width: controllerSize.width, height: controllerSize.height, fps: preset.fps });
+          active.session.sendControl({
+            t: 'resize',
+            width: controllerSize.width,
+            height: controllerSize.height,
+            fps: effectiveFps(),
+            codecs: uiVideoCodecs,
+          });
         }
+      }
+      break;
+    case 'codec-fallback':
+      // Our own UI cannot decode what the host is sending (the WebCodecs
+      // capability probe is best-effort, this is the ground truth). Ask
+      // the host to pin H.264; it stays there for the session.
+      if (active?.role === 'controller') {
+        log('warn', '本机界面无法解码当前视频流，已请求被控回退 H.264');
+        active.session.sendControl({ t: 'codec', codec: 'h264' });
       }
       break;
     case 'input':
@@ -2015,7 +2244,7 @@ ui = await startUiServer({
           ? { width: active.videoSize.width, height: active.videoSize.height, fps: preset.fps }
           : { width: display.width, height: display.height, fps: preset.fps },
       });
-      if (avcConfig) push({ type: 'config', codec: avcConfig.codec, avcC: avcConfig.avcC.toString('base64') });
+      if (streamConfig) push({ type: 'config', codec: streamConfig.codec, description: streamConfig.description.toString('base64') });
       if (active.role === 'controller') active.session.requestKeyframe();
     }
     ws.onMessage((data, isBinary) => {
