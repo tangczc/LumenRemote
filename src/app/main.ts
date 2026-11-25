@@ -329,6 +329,14 @@ let lastStatsLine = '';
 /** Encoder bitrate ceiling learned from congestion feedback (kbps); 0 = use the preset. */
 let adaptedBitrateKbps = 0;
 /**
+ * Slow EMA of the verdict, used ONLY for geometry fitting. The fast
+ * verdict swings 30M -> 3M within a minute on burst artifacts; letting
+ * the picture size follow it rebuilt the peer's decoder 15+ times in
+ * one 217 s session. Bitrate follows the fast verdict (cheap-ish),
+ * geometry follows this (halflife ~20 s of verdict actions).
+ */
+let verdictEmaKbps = 0;
+/**
  * True once a measured congestion verdict (drop OR recovery step) has
  * been applied this session. Geometry fitting keys on this — not on
  * adaptedBitrateKbps alone (it is seeded with the slow-start value, so
@@ -900,7 +908,12 @@ function startEncoder(target: ActiveSession): void {
   // Healthy paths never see this: it only engages once a measured
   // verdict (or the relay cap) is in force.
   if (!probing() && (verdictApplied || relayBudget)) {
-    const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
+    // Fit geometry to the verdict's slow average, not its latest
+    // value: the encoder's bitrate may chase the fast verdict, but
+    // the picture size (and with it the peer's decoder) only moves
+    // when the average says the link really lives somewhere else.
+    const fitRateKbps = verdictEmaKbps > 0 ? Math.min(bitrateKbps, verdictEmaKbps) : bitrateKbps;
+    const fit = fitGeometryForBitrate({ width, height }, fitRateKbps, fps);
     if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
       // Geometry stickiness: a size change forces the peer to rebuild
       // its decoder and eats a keyframe burst on the thinnest part of
@@ -933,7 +946,7 @@ function startEncoder(target: ActiveSession): void {
       } else {
         log(
           'info',
-          `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
+          `网络可用码率均值约 ${fitRateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
         );
         width = fit.width;
         height = fit.height;
@@ -1304,6 +1317,7 @@ function endSession(reason: string): void {
   peerCodecLock = null;
   sessionFps = 0;
   sessionBitrateKbps = 0;
+  verdictEmaKbps = 0;
   relayBudget = false;
   if (current) {
     current.cancelUpgrade?.();
@@ -1436,8 +1450,12 @@ function startProbe(): void {
   probeUntil = Date.now() + 15000;
   log(
     'warn',
-    '链路测速开始：15 秒测试图固定 45000 kbps 发送（绕过拥塞裁决与尺寸拟合）——期间画面为测试图案，测完自动恢复',
+    '链路测速开始：15 秒测试图固定 45000 kbps 发送（绕过拥塞裁决、尺寸拟合与 pacer 限速）——期间画面为测试图案，测完自动恢复',
   );
+  // Pin the pacer too: without this the wire never carries more than
+  // the congestion controller already believes in, and the "probe"
+  // measures our own limiter instead of the path.
+  active.session.setProbeHold(Math.round(45_000 * NET_OVERHEAD) * 1000);
   active.encoder?.stop();
   startEncoder(active);
   const probingSession = active;
@@ -1446,6 +1464,7 @@ function startProbe(): void {
     probeUntil = 0;
     if (active && active === probingSession && active.role === 'host') {
       log('info', '链路测速结束，恢复正常采集与自适应');
+      active.session.setProbeHold(null);
       active.encoder?.stop();
       startEncoder(active);
     }
@@ -1531,6 +1550,7 @@ async function startSession(
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
+  verdictEmaKbps = 0;
   verdictApplied = false;
   lastEncoderGeom = null;
   lastGeomChangeAt = 0;
@@ -1608,6 +1628,11 @@ async function startSession(
     // down and restarting the encoder again.
     adaptedBitrateKbps = drop ? capped : Math.min(capped, Math.floor(current * 1.5));
     if (capped >= capKbps) adaptedBitrateKbps = 0; // fully recovered: preset rate rules
+    // Geometry follows a slow average of where verdicts land, never
+    // the latest swing (see verdictEmaKbps).
+    const emaTargetKbps = adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps;
+    verdictEmaKbps =
+      verdictEmaKbps === 0 ? emaTargetKbps : Math.round(verdictEmaKbps + (emaTargetKbps - verdictEmaKbps) * 0.3);
     verdictApplied = true;
     log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
     if (active.encoder) {
@@ -1736,6 +1761,7 @@ async function startSession(
           preset = p;
           sessionFps = newFps;
           sessionBitrateKbps = newBitrateKbps;
+          verdictEmaKbps = 0; // an explicit pick applies at once, no averaging-in
           active.session.setMaxBudget(effectiveCeilingBps());
           log(
             'info',
@@ -1988,6 +2014,7 @@ function applyQuality(next: QualityPreset, fps = 0, bitrateKbps = 0): void {
   // but only the preset itself becomes the saved device default.
   sessionFps = fps >= 10 && fps <= 240 ? Math.round(fps) : 0;
   sessionBitrateKbps = bitrateKbps >= 1000 && bitrateKbps <= 60_000 ? Math.round(bitrateKbps) : 0;
+  verdictEmaKbps = 0; // an explicit pick applies at once, no averaging-in
   if (active) active.session.setMaxBudget(effectiveCeilingBps());
   if (active?.role === 'controller') {
     active.session.sendControl({

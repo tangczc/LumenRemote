@@ -10,6 +10,15 @@ export interface ReceiverReport {
   received: number;
   /** Inter-arrival delay gradient in µs; > 0 means a queue is building. */
   delayGradientUs: number;
+  /**
+   * Mean forward one-way delay (µs) of media frames received in this
+   * interval, measured against the clock offset (which is estimated
+   * from minimum-RTT samples and therefore not itself inflated by
+   * queueing). 0 = unknown. This is the corroborating evidence for
+   * the delay gradient: a real queue inflates it, our own keyframe
+   * bursts do not.
+   */
+  oneWayUs?: number;
   /** RFC3550-style jitter estimate in µs. */
   jitterUs: number;
   /** Reporter local monotonic time when the report was produced. */
