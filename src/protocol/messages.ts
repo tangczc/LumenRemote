@@ -11,12 +11,13 @@ export interface ReceiverReport {
   /** Inter-arrival delay gradient in µs; > 0 means a queue is building. */
   delayGradientUs: number;
   /**
-   * Mean forward one-way delay (µs) of media frames received in this
-   * interval, measured against the clock offset (which is estimated
-   * from minimum-RTT samples and therefore not itself inflated by
-   * queueing). 0 = unknown. This is the corroborating evidence for
-   * the delay gradient: a real queue inflates it, our own keyframe
-   * bursts do not.
+   * Mean forward transit delay (µs) of video packets received in
+   * this interval, from pacer-release send timestamps — network
+   * only, excluding the sender's own queue. Carries a constant
+   * clock-epoch offset the sender absorbs via floor tracking.
+   * 0 = unknown. This is the corroborating evidence for the delay
+   * gradient: a real queue inflates it, our own keyframe bursts
+   * (which dwell in the pacer, before the send timestamp) do not.
    */
   oneWayUs?: number;
   /** RFC3550-style jitter estimate in µs. */

@@ -36,6 +36,8 @@ const state = {
   decodeCodecs: ['h264'],
   /** True once we have asked the host to pin H.264 for this session. */
   codecFallbackAsked: false,
+  /** Frame id of the last video frame handed to the decoder (-1: none). */
+  lastVideoFrameId: -1,
 };
 
 /**
@@ -951,10 +953,27 @@ function handleVideo(buf) {
   // dropped until the next keyframe (and ask for one) rather than feeding
   // the decoder references it no longer has.
   const isKey = (flags & 1) !== 0;
+  // Continuity guard for gaps this layer never initiated: frames the
+  // receiver dropped (FEC failure, reorder timeout) never reach us,
+  // and the delta frames after them reference pictures the decoder
+  // does not have. Feeding those anyway produces tiled corruption
+  // that persists until the next keyframe — the exact mosaic seen in
+  // sessions with heavy verdict-driven encoder restarts. Treat any
+  // frame-id gap like our own drop: wait for (and, if stale, request)
+  // a keyframe instead of decoding into a broken reference chain.
+  const frameId = new DataView(buf).getUint32(4);
   if (isKey) {
     state.waitingForKey = false;
     state.lastKeyAt = performance.now();
-  } else if (state.waitingForKey) return;
+    state.lastVideoFrameId = frameId;
+  } else if (state.lastVideoFrameId >= 0 && frameId !== state.lastVideoFrameId + 1) {
+    state.waitingForKey = true;
+    if (performance.now() - (state.lastKeyAt ?? 0) > 1500) send({ type: 'keyframe' });
+    return;
+  } else {
+    state.lastVideoFrameId = frameId;
+  }
+  if (!isKey && state.waitingForKey) return;
   else if (state.decoder.decodeQueueSize > 4) {
     state.waitingForKey = true;
     // Asking for a keyframe restarts the host's encoder — a stall plus the
