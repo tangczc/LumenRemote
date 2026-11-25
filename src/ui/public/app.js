@@ -32,7 +32,41 @@ const state = {
   activeDisplay: 0,
   /** fit | hd | native — how the stage shows and sizes the stream. */
   viewMode: 'fit',
+  /** Video codecs this UI can decode, best first (WebCodecs probe). */
+  decodeCodecs: ['h264'],
+  /** True once we have asked the host to pin H.264 for this session. */
+  codecFallbackAsked: false,
 };
+
+/**
+ * Which video codecs can this browser actually decode? H.265 is only
+ * negotiated when a hardware-backed WebCodecs config reports support;
+ * guessing wrong would leave the stage black, so anything short of a
+ * positive answer keeps the session on H.264. Probed once, then cached.
+ */
+let decodeProbePromise = null;
+function probeDecodeCodecs() {
+  if (!decodeProbePromise) {
+    decodeProbePromise = (async () => {
+      const list = ['h264'];
+      if (typeof VideoDecoder !== 'undefined') {
+        try {
+          const probe = await VideoDecoder.isConfigSupported({
+            codec: 'hvc1.1.6.L120.90',
+            optimizeForLatency: true,
+            hardwareAcceleration: 'prefer-hardware',
+          });
+          if (probe.supported) list.unshift('hevc');
+        } catch {
+          /* no HEVC: H.264 it is */
+        }
+      }
+      state.decodeCodecs = list;
+      return list;
+    })();
+  }
+  return decodeProbePromise;
+}
 
 /* ------------------------------------------------------------------ utils */
 
@@ -254,7 +288,7 @@ function reportClientDisplay() {
     const key = `${state.viewMode}:${width}x${height}`;
     if (key === lastClientDisplay) return;
     lastClientDisplay = key;
-    send({ type: 'client-display', width, height });
+    send({ type: 'client-display', width, height, codecs: state.decodeCodecs });
     return;
   }
   const rect = stage.getBoundingClientRect();
@@ -272,7 +306,7 @@ function reportClientDisplay() {
   const key = `fit:${width}x${height}`;
   if (key === lastClientDisplay) return;
   lastClientDisplay = key;
-  send({ type: 'client-display', width, height });
+  send({ type: 'client-display', width, height, codecs: state.decodeCodecs });
 }
 
 function scheduleClientDisplay() {
@@ -284,6 +318,14 @@ function scheduleClientDisplay() {
 }
 
 window.addEventListener('resize', scheduleClientDisplay);
+
+// Probe decode capabilities up front; when the answer lands, re-report
+// the display (bypassing the size dedup) so the codec list reaches the
+// app even if the window never resizes.
+probeDecodeCodecs().then(() => {
+  lastClientDisplay = '';
+  reportClientDisplay();
+});
 
 /* ---------------------------------------------------------------- fullscreen */
 
@@ -616,6 +658,7 @@ function enterSession(msg) {
   state.session = msg;
   const banner = $('#secureBanner');
   if (banner) banner.hidden = true;
+  state.codecFallbackAsked = false;
   state.decodedFrames = 0;
   state.lastOneWayMs = null;
   $('#requestModal').hidden = true;
@@ -735,14 +778,29 @@ function exitSession(reason) {
 
 /* --------------------------------------------------------------- decoding */
 
+/**
+ * The stream in front of us cannot be decoded here (almost always:
+ * negotiated H.265 but no hardware HEVC decoder behind WebCodecs).
+ * Ask the host to pin H.264 — once per session; the host honours it
+ * for the rest of the session, so this never loops.
+ */
+function requestCodecFallback() {
+  if (state.codecFallbackAsked) return;
+  state.codecFallbackAsked = true;
+  logLine('warn', '本机无法解码 H.265，已请求被控回退 H.264');
+  toast('本机不支持 H.265 硬解，已自动回退 H.264', 'warn');
+  send({ type: 'codec-fallback' });
+}
+
 function configureDecoder(cfg) {
   state.lastConfig = cfg;
-  // Key on codec AND avcC: a host encoder restart at a new resolution
-  // changes the SPS (inside avcC) but not the codec string. Keying on the
-  // codec alone kept the old decoder chewing new-size frames until it
-  // errored — and with no new config ever arriving, that freeze was
-  // permanent while the session stats looked perfectly healthy.
-  const key = `${cfg.codec}|${cfg.avcC}`;
+  // Key on codec AND description: a host encoder restart at a new
+  // resolution changes the SPS (inside the record) but not the codec
+  // string. Keying on the codec alone kept the old decoder chewing
+  // new-size frames until it errored — and with no new config ever
+  // arriving, that freeze was permanent while the session stats
+  // looked perfectly healthy.
+  const key = `${cfg.codec}|${cfg.description}`;
   if (state.configuredKey === key && state.decoder?.state === 'configured') return;
   state.configuredKey = key;
   state.lastDecoderBuildAt = performance.now();
@@ -753,13 +811,31 @@ function configureDecoder(cfg) {
   }
 
   teardownDecoder();
-  const description = Uint8Array.from(atob(cfg.avcC), (c) => c.charCodeAt(0));
+  const description = Uint8Array.from(atob(cfg.description), (c) => c.charCodeAt(0));
+  const decoderConfig = { codec: cfg.codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' };
+  // Verify against the real SPS-derived config, not the generic probe:
+  // a machine can pass the canned HEVC probe yet reject a specific
+  // profile/level. Ground truth beats optimism — fall back to H.264
+  // instead of leaving a black stage up.
+  VideoDecoder.isConfigSupported(decoderConfig)
+    .then((probe) => {
+      if (!probe.supported && cfg.codec.startsWith('hvc1')) requestCodecFallback();
+    })
+    .catch(() => {
+      if (cfg.codec.startsWith('hvc1')) requestCodecFallback();
+    });
   const decoder = new VideoDecoder({
     output: onDecodedFrame,
     error: (err) => {
       logLine('error', `解码失败 ${err.message}`);
       if (state.decoder === decoder) state.decoder = null;
       state.configuredKey = '';
+      // HEVC that configures but cannot decode: stop rebuilding the
+      // same broken decoder and drop to H.264 for the session.
+      if (cfg.codec.startsWith('hvc1') && state.decodedFrames === (state.framesAtConfigStart ?? 0)) {
+        requestCodecFallback();
+        return;
+      }
       // Rebuild from the last config we were given instead of waiting
       // for a config message that may never come (the engine only sends
       // one when the stream parameters actually change). A fresh
@@ -768,8 +844,9 @@ function configureDecoder(cfg) {
       send({ type: 'keyframe' });
     },
   });
-  decoder.configure({ codec: cfg.codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
+  decoder.configure(decoderConfig);
   state.decoder = decoder;
+  state.framesAtConfigStart = state.decodedFrames;
   // A fresh decoder has no reference frames; drop deltas until the next
   // keyframe (the frame that carried this config is one, and arrives
   // right behind it on the same socket).

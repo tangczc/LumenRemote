@@ -1,8 +1,26 @@
 import { spawn, spawnSync, type ChildProcess, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable } from 'node:stream';
-import { AccessUnitAssembler, type AccessUnit } from './nal.ts';
+import { AccessUnitAssembler, HevcNalType, NalType, joinAnnexB, type AccessUnit, type VideoCodecKind } from './nal.ts';
 
-export type EncoderName = 'libx264' | 'h264_nvenc' | 'h264_qsv' | 'h264_amf';
+export type EncoderName =
+  | 'libx264'
+  | 'h264_nvenc'
+  | 'h264_qsv'
+  | 'h264_amf'
+  | 'libx265'
+  | 'hevc_nvenc'
+  | 'hevc_qsv'
+  | 'hevc_amf';
+
+const HEVC_ENCODERS: EncoderName[] = ['hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libx265'];
+const HW_HEVC_ENCODERS: EncoderName[] = ['hevc_nvenc', 'hevc_qsv', 'hevc_amf'];
+
+/** Which codec family an encoder name (or an explicit request) belongs to. */
+export function codecKindOf(opts: { encoder?: EncoderName | 'auto'; codec?: VideoCodecKind }): VideoCodecKind {
+  if (opts.codec) return opts.codec;
+  if (opts.encoder && opts.encoder !== 'auto') return HEVC_ENCODERS.includes(opts.encoder) ? 'hevc' : 'h264';
+  return 'h264';
+}
 
 export interface ScreenSource {
   kind: 'screen';
@@ -40,6 +58,14 @@ export interface EncoderOptions {
   fps?: number;
   bitrateKbps?: number;
   encoder?: EncoderName | 'auto';
+  /**
+   * Codec family to encode. Defaults to the family of an explicitly
+   * named encoder, else H.264. With `encoder: 'auto'` the resolver
+   * picks inside this family, so 'hevc' means a hardware HEVC encoder
+   * (or libx265 as a last resort inside buildEncoderArgs' caller —
+   * see hevcHardwareEncoder).
+   */
+  codec?: VideoCodecKind;
   ffmpegPath?: string;
   gopFrames?: number;
   /**
@@ -60,7 +86,7 @@ function availableEncoders(ffmpegPath: string): Set<string> {
     const r = spawnSync(ffmpegPath, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 8000 });
     const text = `${r.stdout ?? ''}`;
     const set = new Set<string>();
-    for (const name of ['libx264', 'h264_nvenc', 'h264_qsv', 'h264_amf']) {
+    for (const name of ['libx264', 'h264_nvenc', 'h264_qsv', 'h264_amf', 'libx265', 'hevc_nvenc', 'hevc_qsv', 'hevc_amf']) {
       if (text.includes(` ${name} `)) set.add(name);
     }
     cachedEncoders = set;
@@ -71,13 +97,29 @@ function availableEncoders(ffmpegPath: string): Set<string> {
   }
 }
 
-export function resolveEncoder(name: EncoderName | 'auto', ffmpegPath = 'ffmpeg'): EncoderName {
+export function resolveEncoder(name: EncoderName | 'auto', ffmpegPath = 'ffmpeg', codec: VideoCodecKind = 'h264'): EncoderName {
   if (name !== 'auto') return name;
   const available = availableEncoders(ffmpegPath);
-  for (const candidate of ['h264_nvenc', 'h264_qsv', 'h264_amf'] as EncoderName[]) {
+  const candidates: EncoderName[] =
+    codec === 'hevc' ? [...HW_HEVC_ENCODERS, 'libx265'] : ['h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264'];
+  for (const candidate of candidates) {
     if (available.has(candidate)) return candidate;
   }
-  return 'libx264';
+  return codec === 'hevc' ? 'libx265' : 'libx264';
+}
+
+/**
+ * First hardware HEVC encoder this FFmpeg offers, or null. The session
+ * layer only negotiates H.265 when this returns a name: libx265 at
+ * desktop resolutions costs cores the game wants, and a slow encoder
+ * would trade the codec's bitrate win for latency.
+ */
+export function hevcHardwareEncoder(ffmpegPath = 'ffmpeg'): EncoderName | null {
+  const available = availableEncoders(ffmpegPath);
+  for (const candidate of HW_HEVC_ENCODERS) {
+    if (available.has(candidate)) return candidate;
+  }
+  return null;
 }
 
 /** True when this build of FFmpeg can capture through Desktop Duplication. */
@@ -120,7 +162,8 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   const kbps = opts.bitrateKbps ?? 12_000;
   const gop = opts.gopFrames ?? Math.max(60, Math.round(fps * 2));
   const ffmpegPath = opts.ffmpegPath ?? 'ffmpeg';
-  const encoder = resolveEncoder(opts.encoder ?? 'auto', ffmpegPath);
+  const codec = codecKindOf(opts);
+  const encoder = resolveEncoder(opts.encoder ?? 'auto', ffmpegPath, codec);
   const captureMode = resolveCaptureMode(opts, ffmpegPath);
 
   const target = opts.targetSize;
@@ -141,7 +184,7 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
   // (and any resize, which no scaler can do on GPU surfaces) round-trips
   // through system memory with hwdownload. That copy is still much
   // cheaper than a GDI capture of the same desktop.
-  const gpuDirect = encoder === 'h264_nvenc' && !scaleFilter;
+  const gpuDirect = (encoder === 'h264_nvenc' || encoder === 'hevc_nvenc') && !scaleFilter;
   // Multi-monitor: ddagrab addresses the DXGI output directly (output_idx
   // follows the same enumeration order as the display list the host reports),
   // so a secondary screen costs no extra copy. Only set it past the primary
@@ -234,6 +277,43 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
     ],
     h264_qsv: ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-low_power', '1', '-profile:v', 'high', ...common],
     h264_amf: ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cbr', '-profile:v', 'high', ...common],
+    // HEVC buys roughly a third more picture per bit than H.264 at
+    // desktop resolutions — the gap to commercial tools (UU streams
+    // H.265) at identical latency and frame rate. Same rate-control
+    // shape as the H.264 hardware paths so the congestion contract
+    // (CBR, ~3-frame VBV, no B-frames) is unchanged.
+    hevc_nvenc: [
+      '-c:v',
+      'hevc_nvenc',
+      '-preset',
+      'p4',
+      '-tune',
+      'ull',
+      '-spatial-aq',
+      '1',
+      '-rc',
+      'cbr',
+      '-zerolatency',
+      '1',
+      '-profile:v',
+      'main',
+      ...common,
+    ],
+    hevc_qsv: ['-c:v', 'hevc_qsv', '-preset', 'veryfast', '-low_power', '1', '-profile:v', 'main', ...common],
+    hevc_amf: ['-c:v', 'hevc_amf', '-quality', 'speed', '-rc', 'cbr', '-profile:v', 'main', ...common],
+    libx265: [
+      '-c:v',
+      'libx265',
+      '-preset',
+      'ultrafast',
+      '-tune',
+      'zerolatency',
+      '-profile:v',
+      'main',
+      '-x265-params',
+      'bframes=0:repeat-headers=1:scenecut=0',
+      ...common,
+    ],
   };
 
   return [
@@ -245,7 +325,7 @@ export function buildEncoderArgs(opts: EncoderOptions): string[] {
     '-flush_packets',
     '1',
     '-f',
-    'h264',
+    codec === 'hevc' ? 'hevc' : 'h264',
     'pipe:1',
   ];
 }
@@ -262,13 +342,34 @@ export class ScreenEncoder {
   private restarted = false;
   private stopped = false;
   private flushTimer: NodeJS.Timeout | null = null;
+  /** Last parameter sets seen, for keyframes that arrive without them. */
+  private paramCache: Buffer | null = null;
 
   constructor(private readonly opts: EncoderOptions) {
+    const codec = codecKindOf(opts);
     this.assembler = new AccessUnitAssembler((au) => {
       this.framesSeen++;
+      // Some encoders only emit parameter sets once at stream start.
+      // A decoder joining mid-stream (or rebuilt after a resize) then
+      // has nothing to configure from until the encoder restarts.
+      // Cache the sets and prepend them to any keyframe that lacks
+      // them; decoders tolerate the repetition when they do arrive.
+      const paramTypes: number[] =
+        codec === 'hevc' ? [HevcNalType.Vps, HevcNalType.Sps, HevcNalType.Pps] : [NalType.Sps, NalType.Pps];
+      const params = au.units.filter((u) => paramTypes.includes(u.type));
+      if (params.length > 0) {
+        this.paramCache = joinAnnexB(params);
+      } else if (au.isKey && this.paramCache) {
+        au = { ...au, payload: Buffer.concat([this.paramCache, au.payload]), hasSps: true, hasPps: true, hasVps: codec === 'hevc' };
+      }
       this.opts.onAccessUnit(au);
-    });
+    }, codec);
     this.currentMode = resolveCaptureMode(opts, opts.ffmpegPath ?? 'ffmpeg');
+  }
+
+  /** Codec family this encoder emits ('h264' | 'hevc'). */
+  get codecKind(): VideoCodecKind {
+    return codecKindOf(this.opts);
   }
 
   get args(): string[] {
