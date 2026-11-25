@@ -305,6 +305,28 @@ export class Session {
     this.lastTargetBps = this.cc.targetBps;
   }
 
+  private probeHoldBps: number | null = null;
+
+  /**
+   * Pin the pacer at a fixed rate for a link probe (null releases).
+   * The encoder going flat-out is only half a measurement: the pacer
+   * otherwise keeps following the congestion target, so the wire never
+   * sees more than the controller already believes in — the first
+   * field probe "measured" 4.5 Mbps of a 45 Mbps offer and proved
+   * nothing about the path. While held, receiver reports are also
+   * kept out of the congestion controller: probe traffic is
+   * deliberately abusive and must not poison the verdict the session
+   * resumes with.
+   */
+  setProbeHold(bps: number | null): void {
+    this.probeHoldBps = bps;
+    if (bps !== null) {
+      this.cc.setTarget(bps);
+      this.pacer.setRate(bps);
+      this.lastTargetBps = bps;
+    }
+  }
+
   /** Drop queued media frames, e.g. after an encoder restart. */
   discardPendingMedia(): void {
     this.pacer.clearMedia();
@@ -677,12 +699,20 @@ export class Session {
     }
   }
 
+  /** One-way delay accumulation for the next receiver report. */
+  private oneWayAccumUs = 0;
+  private oneWaySamples = 0;
+
   private emitFrame(frame: IncomingFrame): void {
     this.framesReceived++;
     this.intervalFrames++;
     if (this.clock.synced) {
       const captureLocal = this.clock.toLocal(Number(frame.captureTsUs));
       if (captureLocal > 0) frame.oneWayUs = Math.max(0, frame.rxUs - captureLocal);
+    }
+    if (frame.oneWayUs > 0) {
+      this.oneWayAccumUs += frame.oneWayUs;
+      this.oneWaySamples++;
     }
     this.opts.onFrame?.(frame);
   }
@@ -691,10 +721,12 @@ export class Session {
 
   private onReport(r: ReceiverReport): void {
     if (r.received === 0 && r.lost === 0) return;
+    if (this.probeHoldBps !== null) return; // link probe: pacer pinned, verdict frozen
     const rttUs = Math.max(1, this.clock.rttUs || 30_000);
     this.cc.onSample({
       lossRate: r.lost / Math.max(1, r.lost + r.received),
       delayGradientUs: r.delayGradientUs,
+      oneWayUs: r.oneWayUs ?? 0,
       rttUs,
     });
     const target = this.cc.targetBps;
@@ -761,7 +793,10 @@ export class Session {
       delayGradientUs: Math.round(this.gradient.take()),
       jitterUs: Math.round(this.jitter.valueUs),
       nowUs: this.nowUs(),
+      oneWayUs: this.oneWaySamples > 0 ? Math.round(this.oneWayAccumUs / this.oneWaySamples) : 0,
     };
+    this.oneWayAccumUs = 0;
+    this.oneWaySamples = 0;
     this.sendControl({ t: 'report', report });
   }
 

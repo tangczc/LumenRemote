@@ -13,11 +13,18 @@ describe('congestion controller', () => {
   test('decreases on sustained queueing, recovers when clean', () => {
     let now = 0;
     const cc = new CongestionController({ initialBps: 8_000_000, minBps: 500_000, maxBps: 20_000_000, nowMs: () => now });
+    // Establish the path's RTT floor first: a real queue inflates
+    // absolute delay, and the controller (rightly) demands that
+    // corroboration before acting on the delay gradient.
+    for (let i = 0; i < 5; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 68_000, oneWayUs: 34_000 });
+    }
     const start = cc.targetBps;
 
     for (let i = 0; i < 10; i++) {
       now += 50;
-      cc.onSample({ lossRate: 0, delayGradientUs: 30_000, rttUs: 40_000 });
+      cc.onSample({ lossRate: 0, delayGradientUs: 30_000, rttUs: 68_000, oneWayUs: 90_000 });
     }
     assert.ok(cc.targetBps < start, `expected decrease, got ${cc.targetBps} vs ${start}`);
     const afterDecrease = cc.targetBps;
@@ -89,15 +96,39 @@ describe('estimators', () => {
   test('congestion controller backs off on mild but persistent queue growth', () => {
     // +3 ms of queue growth per report interval never crosses the overuse
     // threshold, yet the queue grows without bound; the controller must
-    // still shed rate instead of increasing forever.
+    // still shed rate instead of increasing forever. The RTT floor is
+    // established first, then inflates with the queue as a real one does.
     let now = 0;
     const cc = new CongestionController({ initialBps: 10_000_000, minBps: 500_000, maxBps: 20_000_000, nowMs: () => now });
-    const start = cc.targetBps;
+    let peak = cc.targetBps;
     for (let i = 0; i < 60; i++) {
       now += 20;
-      cc.onSample({ lossRate: 0, delayGradientUs: 3_000, rttUs: 40_000 });
+      cc.onSample({ lossRate: 0, delayGradientUs: 3_000, rttUs: 68_000, oneWayUs: 34_000 + Math.min(40_000, i * 700) });
+      peak = Math.max(peak, cc.targetBps);
     }
-    assert.ok(cc.targetBps < start, `expected decrease, got ${cc.targetBps} vs ${start}`);
+    // It may probe upward before the trend warms up, but once the
+    // queue corroborates itself it must shed rate, not ride the peak.
+    assert.ok(cc.targetBps < peak * 0.9, `expected decrease from peak, got ${cc.targetBps} vs peak ${peak}`);
+  });
+
+  test('delay-gradient spikes with a flat RTT do not crash the rate', () => {
+    // Field regression (2026-11-25): one session's RTT sat at 67 ms ±1 ms
+    // for three minutes with ~0% loss, yet gradient readings — manufactured
+    // by our own keyframe bursts after every verdict-driven encoder
+    // restart — kept cutting the target to a tenth of the preset. A queue
+    // that never inflates absolute delay is not a queue.
+    let now = 0;
+    const cc = new CongestionController({ initialBps: 30_000_000, minBps: 400_000, maxBps: 37_500_000, nowMs: () => now });
+    for (let i = 0; i < 5; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 67_000, oneWayUs: 33_700 });
+    }
+    const start = cc.targetBps;
+    for (let i = 0; i < 40; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 25_000, rttUs: 67_000, oneWayUs: 33_700 });
+    }
+    assert.ok(cc.targetBps >= start, `expected no decrease, got ${cc.targetBps} vs ${start}`);
   });
 
   test('jitter tracks arrival variance', () => {

@@ -12,6 +12,12 @@ export interface CongestionSample {
   delayGradientUs: number;
   /** Smoothed RTT in µs */
   rttUs: number;
+  /**
+   * Mean forward one-way delay (µs) the receiver measured for media in
+   * this interval; 0 = unknown. The clock RTT cannot corroborate
+   * queueing (it is minimum-filtered by design), this can.
+   */
+  oneWayUs?: number;
 }
 
 /**
@@ -39,6 +45,10 @@ export class CongestionController {
 
   /** Smoothed RTT in µs. */
   srttUs = 0;
+  /** Smoothed receiver-measured one-way delay (µs). */
+  private oneWaySmoothUs = 0;
+  /** Lowest one-way delay seen (µs), creeping up so route changes re-baseline. */
+  private minOneWayUs = 0;
   /** Last observed loss ratio. */
   lossRate = 0;
   /** 'increase' | 'hold' | 'decrease' */
@@ -78,13 +88,42 @@ export class CongestionController {
     }
     this.hasReport = true;
 
+    // Track the forward path's one-way delay floor (from the receiver's
+    // per-frame measurements). It creeps up slowly (25 µs/sample) so a
+    // genuine route change re-baselines within seconds, while a
+    // constant path pins it at the floor.
+    const oneWay = s.oneWayUs ?? 0;
+    if (oneWay > 0) {
+      this.oneWaySmoothUs = this.oneWaySmoothUs === 0 ? oneWay : this.oneWaySmoothUs * 0.8 + oneWay * 0.2;
+      if (this.minOneWayUs === 0 || oneWay < this.minOneWayUs) this.minOneWayUs = oneWay;
+      else this.minOneWayUs = Math.min(this.minOneWayUs + 25, oneWay);
+    }
+
     // delayGradientUs is now the TOTAL queue growth over one report
     // interval (~20 ms), so the thresholds are on that scale: a queue
     // growing >6 ms per interval is being fed far beyond capacity, while
     // >1.2 ms per interval sustained still means the queue grows without
     // bound, just slower.
-    const overusing = this.trendUs > 6_000;
-    const queueGrowing = this.trendUs > 1_200;
+    //
+    // But the gradient alone is not evidence: our own keyframe bursts
+    // (an encoder restart every verdict) compress and stretch packet
+    // arrival exactly like a building queue. A real queue MUST also
+    // inflate absolute one-way delay — in the 2026-11-25 field session
+    // the one-way delay sat at ~34 ms for three minutes (loss ~0%)
+    // while gradient-driven verdicts crashed the encoder to a tenth
+    // of the preset over and over, each crash manufacturing the next
+    // burst. So gradient signals only count when the receiver's
+    // measured one-way delay stands measurably above its floor; loss
+    // remains a standalone signal because dropped packets are not a
+    // burst artifact. (The clock RTT cannot serve as the check: it is
+    // minimum-filtered precisely to exclude queueing.)
+    const queueInflated = this.oneWaySmoothUs > 0 && this.oneWaySmoothUs > this.minOneWayUs + 8_000;
+    const overusing = queueInflated && this.trendUs > 6_000;
+    const queueGrowing = queueInflated && this.trendUs > 1_200;
+    // The raw trend, gate or no gate: while arrivals keep stretching,
+    // never add rate — the queue may simply not have inflated the
+    // smoothed RTT past the corroboration threshold yet.
+    const trendGrowing = this.trendUs > 1_200;
     const lossy = this.lossRate > 0.05;
     const mildlyLossy = this.lossRate > 0.02;
 
@@ -124,9 +163,9 @@ export class CongestionController {
     // Do not add rate while any measurable queue is building; a rising trend
     // means the link is already at its limit even before it crosses the
     // overuse threshold.
-    this.consecutiveClean = queueGrowing ? 0 : this.consecutiveClean + 1;
+    this.consecutiveClean = trendGrowing ? 0 : this.consecutiveClean + 1;
 
-    if (!queueGrowing && this.consecutiveClean >= 2 && now - this.lastDecreaseMs > 300 && now - this.lastIncreaseMs > 120) {
+    if (!trendGrowing && this.consecutiveClean >= 2 && now - this.lastDecreaseMs > 300 && now - this.lastIncreaseMs > 120) {
       // Ramp eagerly after a quiet period: starting conservative and crawling
       // back up keeps interactive latency high for seconds.
       this.target = Math.min(this.maxBps, this.target * 1.25 + 48_000);
