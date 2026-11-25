@@ -82,9 +82,12 @@ export type ControlMessage =
    * QUALITY_PRESETS, validated by the receiver). Quality used to be a
    * per-device local setting only, so a controller picking 游戏/4K
    * changed nothing on the host, which kept encoding at its own
-   * saved (usually 30 fps) preset.
+   * saved (usually 30 fps) preset. `fps` / `bitrateKbps` are
+   * session-scoped overrides on top of the preset (UU-style tiers:
+   * 原画 30M is a bitrate choice, frame rate is picked independently);
+   * absent or 0 means "the preset's own value".
    */
-  | { t: 'quality'; preset: string }
+  | { t: 'quality'; preset: string; fps?: number; bitrateKbps?: number }
   /**
    * Controller -> host: run a 15 s link probe. The host encodes a
    * full-motion test pattern at a fixed high bitrate with every

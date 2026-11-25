@@ -553,8 +553,8 @@ function renderSettings() {
   $('#handOverDisplay').checked = s.handOverDisplay !== false;
   $('#blackOutScreen').checked = s.blackOutScreen === true;
   for (const chip of $$('#qualityChips .chip')) chip.classList.toggle('active', chip.dataset.preset === s.quality);
-  const qualitySelect = $('#qualitySelect');
-  if (qualitySelect && qualitySelect.value !== s.quality) qualitySelect.value = s.quality;
+  // #qualitySelect is session-scoped (UU-style tiers) and initialised in
+  // enterSession; the saved device default must not stomp it here.
 }
 
 function renderFavorites() {
@@ -658,6 +658,14 @@ function enterSession(msg) {
   state.session = msg;
   const banner = $('#secureBanner');
   if (banner) banner.hidden = true;
+  // Session quality pickers start from the saved device preset; the
+  // first change the user makes re-sends them as session overrides.
+  const tierByPreset = { office: 'auto', balanced: 'auto', game: 'source30', uhd: 'uhd' };
+  const fpsByPreset = { office: '30', balanced: '30', game: '60', uhd: '60' };
+  const qualityEl = $('#qualitySelect');
+  if (qualityEl) qualityEl.value = tierByPreset[state.settings.quality] ?? 'auto';
+  const fpsEl = $('#fpsSelect');
+  if (fpsEl) fpsEl.value = fpsByPreset[state.settings.quality] ?? '60';
   state.codecFallbackAsked = false;
   state.decodedFrames = 0;
   state.lastOneWayMs = null;
@@ -1271,14 +1279,32 @@ function connectPeer(rawCode, password) {
   send({ type: 'connect', code, password: pass });
 }
 
+/* UU-style session quality: the bitrate tier and the frame rate are
+ * independent picks. A tier is a preset plus an optional session
+ * bitrate override; the frame rate rides along on every change and
+ * the host caps it at the panel's real refresh rate. */
+const QUALITY_TIERS = {
+  auto: { preset: 'balanced' },
+  source30: { preset: 'game', bitrateKbps: 30000 },
+  super14: { preset: 'balanced', bitrateKbps: 14000 },
+  hd8: { preset: 'balanced', bitrateKbps: 8000 },
+  uhd: { preset: 'uhd' },
+};
+
+function sendStreamQuality() {
+  const tierKey = $('#qualitySelect')?.value ?? 'auto';
+  const tier = QUALITY_TIERS[tierKey] ?? QUALITY_TIERS.auto;
+  const fps = Number($('#fpsSelect')?.value || 60);
+  // Goes to our engine, which applies it locally and (as controller)
+  // forwards it to the host — the host is the one encoding.
+  send({ type: 'quality', preset: tier.preset, fps, bitrateKbps: tier.bitrateKbps });
+  const tierLabel = $('#qualitySelect')?.selectedOptions?.[0]?.textContent ?? tierKey;
+  toast(`画质已切换：${tierLabel} · ${fps} 帧（被控将重启编码，画面会顿一下）`);
+}
+
 function bindEvents() {
-  $('#qualitySelect')?.addEventListener('change', (ev) => {
-    // Goes to our engine, which applies it locally and (as controller)
-    // forwards it to the host — the host is the one encoding.
-    send({ type: 'quality', preset: ev.target.value });
-    const label = ev.target.selectedOptions?.[0]?.textContent ?? ev.target.value;
-    toast(`画质已切换：${label}（被控将重启编码，画面会顿一下）`);
-  });
+  $('#qualitySelect')?.addEventListener('change', sendStreamQuality);
+  $('#fpsSelect')?.addEventListener('change', sendStreamQuality);
   $('#viewMode')?.addEventListener('change', (ev) => {
     applyViewMode(ev.target.value);
     if (ev.target.value === 'hd') toast('高清适应：按对方原始分辨率传输（更清晰，更耗带宽）');

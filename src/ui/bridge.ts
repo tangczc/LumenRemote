@@ -45,7 +45,8 @@ export type UiToApp =
   | { type: 'decline'; sessionId: string; reason?: string }
   | { type: 'connect'; code: string; password?: string }
   | { type: 'disconnect' }
-  | { type: 'quality'; preset: QualityPreset }
+  /** Session quality pick. fps/bitrateKbps optionally override the preset for this session (UU-style bitrate tiers + independent frame rate); they are never persisted as the device default. */
+  | { type: 'quality'; preset: QualityPreset; fps?: number; bitrateKbps?: number }
   | { type: 'keyframe' }
   | { type: 'probe' }
   /**

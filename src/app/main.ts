@@ -401,6 +401,21 @@ const decodeInUi = values.display === 'ui';
 let peerVideoCodecs: string[] = ['h264'];
 /** Set when the peer's decoder rejected HEVC mid-session: stay on H.264. */
 let peerCodecLock: 'h264' | null = null;
+/**
+ * Session-scoped quality overrides from the controller's UU-style
+ * picker (bitrate tier + independent frame rate). 0 = follow the
+ * preset. Never persisted: the device default stays the preset.
+ */
+let sessionFps = 0;
+let sessionBitrateKbps = 0;
+
+function effectiveFps(): number {
+  return sessionFps > 0 ? sessionFps : preset.fps;
+}
+
+function effectiveBitrateKbps(): number {
+  return sessionBitrateKbps > 0 ? sessionBitrateKbps : preset.bitrateKbps;
+}
 /** Video codecs THIS device's UI can decode (reported by the renderer). */
 let uiVideoCodecs: string[] = ['h264'];
 /** Codec family of the currently running host encoder. */
@@ -853,8 +868,16 @@ function startEncoder(target: ActiveSession): void {
   const negotiated = negotiateSize(capture, peerDisplay);
   let { width, height } = negotiated;
   let scaled = negotiated.scaled;
-  let fps = relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps;
-  const presetKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+  let fps = relayBudget ? Math.min(effectiveFps(), RELAY_FPS) : effectiveFps();
+  // Asking a 60 Hz panel for 144 fps only encodes duplicates. Cap at
+  // the captured display's real refresh rate (UU's 144 option is only
+  // meaningful on high-refresh panels, and says so by its hardware).
+  const panelHz = sel?.refreshRate ?? 0;
+  if (panelHz > 0 && fps > panelHz) {
+    log('info', `请求帧率 ${fps} 超过面板刷新率 ${panelHz} Hz，按 ${panelHz} 执行`);
+    fps = panelHz;
+  }
+  const presetKbps = relayBudget ? Math.min(effectiveBitrateKbps(), RELAY_NET_KBPS) : effectiveBitrateKbps();
   let bitrateKbps = scaled ? scaleBitrate(presetKbps, capture, { width, height }) : presetKbps;
   // The congestion controller's verdict, learned from the wire: never let the
   // encoder produce faster than the path has proven it can carry. Without
@@ -1279,6 +1302,8 @@ function endSession(reason: string): void {
   streamConfig = null;
   peerVideoCodecs = ['h264'];
   peerCodecLock = null;
+  sessionFps = 0;
+  sessionBitrateKbps = 0;
   relayBudget = false;
   if (current) {
     current.cancelUpgrade?.();
@@ -1500,6 +1525,8 @@ async function startSession(
   });
   autoRestarts = 0;
   bakeCursor = false;
+  sessionFps = 0;
+  sessionBitrateKbps = 0;
   // Seed the encoder at the slow-start rate too: an encoder producing the
   // full preset into a 3 Mbps pacer just gets its frames dropped until the
   // first congestion adaptation lands seconds later.
@@ -1535,7 +1562,7 @@ async function startSession(
     // storing it raw restarted the encoder at the *same* capped rate
     // over and over — 16 no-op restarts in one 8-minute session, each
     // costing a stall plus a keyframe burst into a thin uplink.
-    const capKbps = relayBudget ? Math.min(preset.bitrateKbps, RELAY_NET_KBPS) : preset.bitrateKbps;
+    const capKbps = relayBudget ? Math.min(effectiveBitrateKbps(), RELAY_NET_KBPS) : effectiveBitrateKbps();
     const capped = Math.min(kbps, capKbps);
     const current = adaptedBitrateKbps > 0 ? Math.min(adaptedBitrateKbps, capKbps) : capKbps;
     // Wide hysteresis: restarting the encoder costs a pipeline stall
@@ -1695,15 +1722,26 @@ async function startSession(
       if (ctl.t === 'quality' && role === 'host' && active) {
         // Session-scoped: the host owner's own saved default is left
         // untouched; this only steers the running encoder (and the log
-        // says why the fps/bitrate suddenly changed).
+        // says why the fps/bitrate suddenly changed). fps/bitrateKbps
+        // are the controller's UU-style tier overrides on top of the
+        // preset; a change to either alone must also take effect.
         const key = ctl.preset as QualityPreset;
         const p = QUALITY_PRESETS[key];
-        if (p && key !== presetKey) {
+        const newFps = ctl.fps && ctl.fps >= 10 && ctl.fps <= 240 ? Math.round(ctl.fps) : 0;
+        const newBitrateKbps =
+          ctl.bitrateKbps && ctl.bitrateKbps >= 1000 && ctl.bitrateKbps <= 60_000 ? Math.round(ctl.bitrateKbps) : 0;
+        const switchedPreset = key !== presetKey;
+        if (p && (switchedPreset || newFps !== sessionFps || newBitrateKbps !== sessionBitrateKbps)) {
           presetKey = key;
           preset = p;
-          active.session.setMaxBudget(qualityCeilingBps(p));
-          log('info', `主控请求画质 ${p.label} · ${p.fps} fps · ${p.bitrateKbps} kbps`);
-          if (key === 'uhd' && panelHold?.applied) {
+          sessionFps = newFps;
+          sessionBitrateKbps = newBitrateKbps;
+          active.session.setMaxBudget(effectiveCeilingBps());
+          log(
+            'info',
+            `主控请求画质 ${p.label} · ${effectiveFps()} fps · ${effectiveBitrateKbps()} kbps${newBitrateKbps ? '（会话码率覆盖）' : ''}`,
+          );
+          if (key === 'uhd' && switchedPreset && panelHold?.applied) {
             // The panel was taken over (switched down) at session start,
             // so the capture source itself is no longer 4K. Restore the
             // native mode before encoding, or the 4K stream is just an
@@ -1859,7 +1897,7 @@ async function startSession(
       t: 'resize',
       width: controllerSize.width,
       height: controllerSize.height,
-      fps: preset.fps,
+      fps: effectiveFps(),
       codecs: uiVideoCodecs,
     });
   }
@@ -1933,23 +1971,38 @@ function qualityCeilingBps(p: (typeof QUALITY_PRESETS)[QualityPreset]): number {
   return (relayBudget ? Math.min(p.netKbps, RELAY_NET_KBPS) : p.netKbps) * 1000;
 }
 
-function applyQuality(next: QualityPreset): void {
+/** Ceiling for the running session: a custom bitrate tier (UU's 原画 30M etc.) budgets its own network overhead instead of the preset's. */
+function effectiveCeilingBps(): number {
+  const netKbps = sessionBitrateKbps > 0 ? Math.round(sessionBitrateKbps * NET_OVERHEAD) : preset.netKbps;
+  return (relayBudget ? Math.min(netKbps, RELAY_NET_KBPS) : netKbps) * 1000;
+}
+
+function applyQuality(next: QualityPreset, fps = 0, bitrateKbps = 0): void {
   const p = QUALITY_PRESETS[next];
   if (!p) return;
   state = { ...state, quality: next };
   saveState(state);
   preset = p;
   presetKey = next;
-  if (active) active.session.setMaxBudget(qualityCeilingBps(p));
+  // Session-scoped tier overrides (UU-style): applied and forwarded,
+  // but only the preset itself becomes the saved device default.
+  sessionFps = fps >= 10 && fps <= 240 ? Math.round(fps) : 0;
+  sessionBitrateKbps = bitrateKbps >= 1000 && bitrateKbps <= 60_000 ? Math.round(bitrateKbps) : 0;
+  if (active) active.session.setMaxBudget(effectiveCeilingBps());
   if (active?.role === 'controller') {
-    active.session.sendControl({ t: 'quality', preset: next });
+    active.session.sendControl({
+      t: 'quality',
+      preset: next,
+      fps: sessionFps > 0 ? sessionFps : undefined,
+      bitrateKbps: sessionBitrateKbps > 0 ? sessionBitrateKbps : undefined,
+    });
   }
   if (active?.role === 'host' && active.encoder) {
     active.encoder.stop();
     startEncoder(active);
   }
   emitSettings();
-  log('info', `画质 ${p.label} · ${p.bitrateKbps} kbps`);
+  log('info', `画质 ${p.label} · ${effectiveFps()} fps · ${effectiveBitrateKbps()} kbps`);
 }
 
 /**
@@ -1998,7 +2051,7 @@ function handleUi(msg: UiToApp): void {
       }
       break;
     case 'quality':
-      applyQuality(msg.preset);
+      applyQuality(msg.preset, msg.fps ?? 0, msg.bitrateKbps ?? 0);
       break;
     case 'probe':
       if (active?.role === 'controller') active.session.sendControl({ t: 'probe' });
@@ -2033,7 +2086,7 @@ function handleUi(msg: UiToApp): void {
             t: 'resize',
             width: controllerSize.width,
             height: controllerSize.height,
-            fps: preset.fps,
+            fps: effectiveFps(),
             codecs: uiVideoCodecs,
           });
         }
