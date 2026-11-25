@@ -338,6 +338,16 @@ let adaptedBitrateKbps = 0;
  * the fitting gate.
  */
 let verdictApplied = false;
+/** Geometry the running encoder was started with (for fit stickiness). */
+let lastEncoderGeom: { width: number; height: number; fps: number; context: string } | null = null;
+let lastGeomChangeAt = 0;
+/** Link-probe deadline (ms epoch); while in the future, adaptation is off. */
+let probeUntil = 0;
+let probeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function probing(): boolean {
+  return Date.now() < probeUntil;
+}
 let lastBitrateAdaptAt = 0;
 /** Since when the congestion verdict has continuously justified a recovery. */
 let pendingRecoverAt = 0;
@@ -659,8 +669,16 @@ function startForegroundMonitor(): void {
         info.height >= sel.height;
       log(
         'info',
-        `前台应用：${info.name} · 窗口 ${info.width}x${info.height}@${info.x},${info.y}${full ? '（全屏覆盖）' : ''}`,
+        `前台应用：${info.name} · 窗口 ${info.width}x${info.height}@${info.x},${info.y}${full ? '（全屏覆盖）' : ''} · 完整性 ${info.integrity}`,
       );
+    },
+    onSelfIntegrity: (integrity) => {
+      // The injector is spawned from this process, so synthetic input
+      // originates at this level too. If a foreground game logs 高
+      // while this says 中, Windows (UIPI) is dropping our input
+      // before the game ever sees it — a different wall than games
+      // filtering injected-flag events, with a different fix.
+      log('info', `本机进程完整性：${integrity}（注入器同级，合成输入的出发级别）`);
     },
   });
   foregroundMonitor.start();
@@ -765,7 +783,14 @@ function startEncoder(target: ActiveSession): void {
   // this the encoder kept emitting the full preset rate into a saturated
   // pacer, which dropped frames, broke reference chains and forced an
   // encoder restart every second — the visible "卡得要死" death spiral.
-  if (adaptedBitrateKbps > 0) bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
+  if (probing()) {
+    // Link probe: fixed high rate, no verdict clamp, no geometry fit —
+    // the stats must show the link's own ceiling, not our control
+    // loops' opinion of it.
+    bitrateKbps = 45000;
+  } else if (adaptedBitrateKbps > 0) {
+    bitrateKbps = Math.max(800, Math.min(bitrateKbps, adaptedBitrateKbps));
+  }
   // When the network (or the relay budget) has cut the bitrate far below
   // what the negotiated pixels need, shrink the picture to fit the
   // bitrate instead of starving every pixel into mosaic blocks. The
@@ -773,23 +798,60 @@ function startEncoder(target: ActiveSession): void {
   // is where most of the input lag on a starved 4K stream comes from.
   // Healthy paths never see this: it only engages once a measured
   // verdict (or the relay cap) is in force.
-  if (verdictApplied || relayBudget) {
+  if (!probing() && (verdictApplied || relayBudget)) {
     const fit = fitGeometryForBitrate({ width, height }, bitrateKbps, fps);
     if (fit.width !== width || fit.height !== height || fit.fps !== fps) {
-      log(
-        'info',
-        `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
-      );
-      width = fit.width;
-      height = fit.height;
-      fps = fit.fps;
-      scaled = true;
+      // Geometry stickiness: a size change forces the peer to rebuild
+      // its decoder and eats a keyframe burst on the thinnest part of
+      // the link. The congestion verdict wobbles every few seconds, so
+      // refitting on every wobble rebuilt the controller's decoder 104
+      // times in one 285 s session (fps samples of 2 amid the storm).
+      // A modest fit now keeps the running geometry — the new bitrate
+      // still applies, and a same-size restart costs no decoder
+      // rebuild. Only a severe collapse (<50% of the running pixels)
+      // or the first fit after a 20 s quiet window changes size; fps
+      // transitions always apply, since yielding frames for pixels is
+      // the point of the fit. Context changes (viewport / quality /
+      // display) reset the stickiness via the context key.
+      const prev = lastEncoderGeom;
+      const fitPx = fit.width * fit.height;
+      const prevPx = prev ? prev.width * prev.height : 0;
+      const sticky =
+        prev !== null &&
+        prev.context === `${negotiated.width}x${negotiated.height}@${fps}` &&
+        fit.fps === prev.fps &&
+        prevPx > 0 &&
+        fitPx >= prevPx * 0.5 &&
+        fitPx <= prevPx * 1.6 &&
+        Date.now() - lastGeomChangeAt < 20000;
+      if (sticky && prev) {
+        width = prev.width;
+        height = prev.height;
+        fps = prev.fps;
+        scaled = true;
+      } else {
+        log(
+          'info',
+          `网络可用码率约 ${bitrateKbps} kbps，编码由 ${width}x${height}@${fps} 调整为 ${fit.width}x${fit.height}@${fit.fps} 以保证清晰度（带宽恢复后自动回升）`,
+        );
+        width = fit.width;
+        height = fit.height;
+        fps = fit.fps;
+        scaled = true;
+        lastGeomChangeAt = Date.now();
+      }
     }
   }
+  lastEncoderGeom = {
+    width,
+    height,
+    fps,
+    context: `${negotiated.width}x${negotiated.height}@${relayBudget ? Math.min(preset.fps, RELAY_FPS) : preset.fps}`,
+  };
   let self: ScreenEncoder | null = null;
   const encoder: ScreenEncoder = new ScreenEncoder({
     source:
-      values.source === 'test'
+      values.source === 'test' || probing()
         ? { kind: 'test', size: `${capture.width}x${capture.height}` }
         : {
             kind: 'screen',
@@ -1113,6 +1175,11 @@ function endSession(reason: string): void {
   foregroundMonitor?.stop();
   foregroundMonitor = null;
   stopDisplayWatcher();
+  if (probeTimer) {
+    clearTimeout(probeTimer);
+    probeTimer = null;
+  }
+  probeUntil = 0;
   secureDesktop = { active: false, name: 'Default' };
   if (current.role === 'host') void releasePanel(reason);
   sendUi({ type: 'session-end', reason });
@@ -1214,6 +1281,36 @@ setInterval(() => {
   if (Date.now() - lastDiscoveryAt > 30000) void refreshDiscovery();
 }, 3000).unref?.();
 
+/**
+ * Fifteen seconds of fixed-rate test pattern with every adaptation
+ * loop disabled (see the 'probe' control message). The stats logged
+ * during the window — offered 45 Mbps vs delivered send/recv, loss,
+ * displayed-vs-received frames — separate a genuinely thin uplink
+ * from our own congestion/restart cycle manufacturing one.
+ */
+function startProbe(): void {
+  if (!active || active.role !== 'host') return;
+  if (probeTimer) clearTimeout(probeTimer);
+  probeUntil = Date.now() + 15000;
+  log(
+    'warn',
+    '链路测速开始：15 秒测试图固定 45000 kbps 发送（绕过拥塞裁决与尺寸拟合）——期间画面为测试图案，测完自动恢复',
+  );
+  active.encoder?.stop();
+  startEncoder(active);
+  const probingSession = active;
+  probeTimer = setTimeout(() => {
+    probeTimer = null;
+    probeUntil = 0;
+    if (active && active === probingSession && active.role === 'host') {
+      log('info', '链路测速结束，恢复正常采集与自适应');
+      active.encoder?.stop();
+      startEncoder(active);
+    }
+  }, 15000);
+  probeTimer.unref?.();
+}
+
 async function startSession(
   msg: Extract<ServerToClient, { t: 'ready' }>,
   eph: EphemeralKeyPair | null,
@@ -1291,6 +1388,8 @@ async function startSession(
   // first congestion adaptation lands seconds later.
   adaptedBitrateKbps = Math.floor(Math.min(preset.netKbps * 1000, START_NET_BPS) / NET_OVERHEAD / 1000);
   verdictApplied = false;
+  lastEncoderGeom = null;
+  lastGeomChangeAt = 0;
   lastBitrateAdaptAt = 0;
   pendingRecoverAt = 0;
   lastVerdictBps = 0;
@@ -1310,6 +1409,7 @@ async function startSession(
   // verdict: record it, and startEncoder picks it up when it starts.
   const applyVerdict = (bps: number): void => {
     if (!active || active.role !== 'host') return;
+    if (probing()) return; // a probe measures the raw link; adapting would contaminate it
     const now = Date.now();
     const kbps = Math.max(800, Math.floor(bps / NET_OVERHEAD / 1000));
     // Judge the verdict against what the encoder can actually run at:
@@ -1347,12 +1447,16 @@ async function startSession(
       if (now - pendingRecoverAt < 3000) return;
     }
     pendingRecoverAt = 0;
-    // Recoveries may land every 3 s: the old flat 8 s cadence meant a
-    // 4K stream spent its first half-minute climbing 2.4M -> 45M in
-    // 1.5x steps, i.e. the user judged "4K" by a low-bitrate smear.
-    // Drops keep the calm 8 s cadence — that direction is the one
-    // that thrashes on a variable link.
-    if (now - lastBitrateAdaptAt < (drop ? 8000 : 3000)) return;
+    // Both directions now land at most every 8 s. Recoveries used to
+    // get a faster 3 s cadence so a fresh 4K stream would not be
+    // judged by its low-bitrate opening — but on a flapping link each
+    // step is an encoder restart plus a keyframe burst, and the steps
+    // fired every few seconds for entire sessions. With geometry
+    // stickiness a slower climb costs little sharpness and buys a
+    // stable picture; drops keep the same cadence (they were never
+    // the thrashy direction once clamped, and 8 s is still fast
+    // enough to protect the link via the pacer in between).
+    if (now - lastBitrateAdaptAt < 8000) return;
     lastBitrateAdaptAt = now;
     // Recover in steps, not in one leap to the (probing) verdict: a
     // 1.5x step that the link cannot hold is absorbed by the pacer
@@ -1436,6 +1540,10 @@ async function startSession(
             startEncoder(active);
           }, 350);
         }
+        return;
+      }
+      if (ctl.t === 'probe' && role === 'host' && active) {
+        startProbe();
         return;
       }
       if (ctl.t === 'quality' && role === 'host' && active) {
@@ -1734,6 +1842,9 @@ function handleUi(msg: UiToApp): void {
       break;
     case 'quality':
       applyQuality(msg.preset);
+      break;
+    case 'probe':
+      if (active?.role === 'controller') active.session.sendControl({ t: 'probe' });
       break;
     case 'keyframe':
       active?.session.requestKeyframe();

@@ -73,6 +73,16 @@ export type ControlMessage =
    */
   | { t: 'quality'; preset: string }
   /**
+   * Controller -> host: run a 15 s link probe. The host encodes a
+   * full-motion test pattern at a fixed high bitrate with every
+   * adaptation loop disabled, so the resulting stats separate "the
+   * link cannot carry more" from "our congestion control / encoder
+   * restart cycle will not let it" — the two were indistinguishable
+   * in normal sessions, which kept the blur/stutter root cause
+   * arguable instead of measured.
+   */
+  | { t: 'probe' }
+  /**
    * Controller -> host: pointer-lock (relative mouse) engaged/released.
    * While locked the browser hides the local cursor, so the host bakes
    * its cursor into the video; without this the user has no pointer.
