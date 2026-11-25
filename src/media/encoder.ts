@@ -315,6 +315,13 @@ export class ScreenEncoder {
       }
     });
     proc.on('exit', (code) => {
+      // The process is gone: say so. `running` used to stay true forever
+      // after a crash (the dead ChildProcess object was never cleared),
+      // which silently disabled every "restart the encoder when X
+      // returns" check — a 4-second UAC desktop cost one session its
+      // picture for the remaining 63 seconds because the desktop
+      // monitor's revive condition could never fire.
+      if (this.proc === proc) this.proc = null;
       this.assembler.flush();
       // stop() kills the process on purpose; without this guard the fallback
       // below would spawn a replacement that nothing owns, and it would keep
@@ -345,6 +352,7 @@ export class ScreenEncoder {
       this.opts.onExit?.(code);
     });
     proc.on('error', (err) => {
+      if (this.proc === proc) this.proc = null;
       this.opts.onLog?.(`ffmpeg spawn failed: ${err.message}`);
       this.opts.onExit?.(-1);
     });

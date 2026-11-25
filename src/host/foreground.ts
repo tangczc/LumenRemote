@@ -65,10 +65,10 @@ public static class LumenFg
                     IntPtr sid = Marshal.ReadIntPtr(buf);
                     byte count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
                     int rid = Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
-                    if (rid >= 0x4000) return "系统";
-                    if (rid >= 0x3000) return "高";
-                    if (rid >= 0x2000) return "中";
-                    return "低";
+                    if (rid >= 0x4000) return "system";
+                    if (rid >= 0x3000) return "high";
+                    if (rid >= 0x2000) return "medium";
+                    return "low";
                 }
                 finally { Marshal.FreeHGlobal(buf); }
             }
@@ -114,6 +114,18 @@ const SCRIPT = [
   '  Start-Sleep -Milliseconds 500',
   '}',
 ].join('\n');
+
+const INTEGRITY_LABELS: Record<string, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  system: '系统',
+};
+
+function integrityLabel(raw: string | undefined): string {
+  const key = (raw ?? '').trim().toLowerCase();
+  return INTEGRITY_LABELS[key] ?? (key || '?');
+}
 
 export interface ForegroundInfo {
   pid: number;
@@ -178,7 +190,7 @@ export class ForegroundMonitor {
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
       if (line.startsWith('self ')) {
-        this.opts.onSelfIntegrity?.(line.slice(5).trim() || '?');
+        this.opts.onSelfIntegrity?.(integrityLabel(line.slice(5).trim()));
         continue;
       }
       if (!line.startsWith('fg ')) continue;
@@ -191,7 +203,7 @@ export class ForegroundMonitor {
       const width = nums[2] ?? 0;
       const height = nums[3] ?? 0;
       if (!Number.isFinite(pid) || !Number.isFinite(width) || !Number.isFinite(height)) continue;
-      this.opts.onChange({ pid, name: parts[1] || '?', x, y, width, height, integrity: parts[3] || '?' });
+      this.opts.onChange({ pid, name: parts[1] || '?', x, y, width, height, integrity: integrityLabel(parts[3]) });
     }
   }
 

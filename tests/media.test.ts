@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AccessUnitAssembler, firstMbInSlice, joinAnnexB, splitAnnexB } from '../src/media/nal.ts';
 import { annexBToAvcc, buildAvcC, codecString, extractParameterSets, streamConfigChanged } from '../src/media/avc.ts';
 import { capSizeForBitrate, fitGeometryForBitrate, negotiateSize, scaleBitrate } from '../src/media/target.ts';
-import { buildEncoderArgs } from '../src/media/encoder.ts';
+import { buildEncoderArgs, ScreenEncoder } from '../src/media/encoder.ts';
 
 /** Build a fake Annex-B stream: SPS, PPS, IDR slice(s), then P slices. */
 function nal(type: number, body: number[]): Buffer {
@@ -357,5 +357,31 @@ describe('encode size negotiation', () => {
     const scaled = buildEncoderArgs({ ...base, targetSize: { width: 1920, height: 1080 } });
     const vf = scaled[scaled.indexOf('-vf') + 1];
     assert.equal(vf, 'scale=1920:1080:flags=fast_bilinear');
+  });
+
+  test('encoder reports not-running after its process exits', { timeout: 15000 }, async () => {
+    // Regression: `running` used to stay true forever after a crash
+    // (the dead ChildProcess was never cleared), which disabled every
+    // revive path in the app — one session kept a frozen picture for
+    // a minute after a 4 s desktop denial because the "restart when
+    // the desktop returns" check could never fire.
+    const exited = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('encoder never exited')), 10000);
+      const enc = new ScreenEncoder({
+        source: { kind: 'test', size: '320x240' },
+        fps: 10,
+        bitrateKbps: 400,
+        encoder: 'libx264',
+        ffmpegPath: process.platform === 'win32' ? 'Z:\\nonexistent\\ffmpeg.exe' : '/bin/false',
+        onAccessUnit: () => {},
+        onExit: () => {
+          clearTimeout(timer);
+          assert.equal(enc.running, false);
+          resolve();
+        },
+      });
+      enc.start();
+    });
+    await exited;
   });
 });

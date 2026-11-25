@@ -381,6 +381,8 @@ let foregroundMonitor: ForegroundMonitor | null = null;
 /** Periodic re-enumeration of the host's displays during a session. */
 let displayWatchTimer: ReturnType<typeof setInterval> | null = null;
 let displayWatchBusy = false;
+/** Periodic check that the host encoder is actually alive. */
+let encoderWatchTimer: ReturnType<typeof setInterval> | null = null;
 /** Encoder crashes absorbed in the current session, so a broken capture cannot loop. */
 let autoRestarts = 0;
 let avcConfig: AvcStreamConfig | null = null;
@@ -692,6 +694,38 @@ function startForegroundMonitor(): void {
  * silently invalidated all of it until the next reconnect. Re-enumerate
  * periodically and re-aim everything at the new layout.
  */
+/**
+ * Revive a dead encoder during a host session, whatever killed it.
+ * Capture death has many transient causes — UAC secure desktops,
+ * display-mode switches by games, GPU driver resets, another app
+ * holding Desktop Duplication — and the previous design's recovery
+ * depended on noticing each cause individually; when one slipped
+ * through (a 4 s desktop denial burned the fast-retry budget, and a
+ * broken `running` flag blocked the desktop monitor's revive), the
+ * session stayed black for a minute while input kept working. A
+ * watchdog that simply asks "is the encoder alive?" every 5 s and
+ * restarts it if not covers the whole class.
+ */
+function startEncoderWatchdog(): void {
+  stopEncoderWatchdog();
+  encoderWatchTimer = setInterval(() => {
+    if (!active || active.role !== 'host') return;
+    if (secureDesktop.active) return; // capture is supposed to be down
+    if (!active.encoder || !active.encoder.running) {
+      log('warn', '看门狗：编码器不在运行，尝试恢复采集');
+      // Fast retries stay exhausted so a persistent denial costs one
+      // spawn per watchdog tick, not a 4-spawn burst every 5 s.
+      autoRestarts = 3;
+      startEncoder(active);
+    }
+  }, 5000);
+}
+
+function stopEncoderWatchdog(): void {
+  if (encoderWatchTimer) clearInterval(encoderWatchTimer);
+  encoderWatchTimer = null;
+}
+
 function startDisplayWatcher(): void {
   stopDisplayWatcher();
   displayWatchTimer = setInterval(() => {
@@ -761,6 +795,11 @@ async function switchDisplay(index: number): Promise<void> {
 }
 
 function startEncoder(target: ActiveSession): void {
+  // Never leave an unowned encoder behind: several callers stop the
+  // old one first, but the watchdog can interleave with an async
+  // display transition and start one the transition does not know
+  // about. Stopping here is cheap insurance against a leak.
+  if (target.encoder && target.encoder.running) target.encoder.stop();
   // Frames queued for the previous encoder belong to a reference chain that the
   // new keyframe replaces; sending them only delays the useful picture.
   target.session.discardPendingMedia();
@@ -902,7 +941,7 @@ function startEncoder(target: ActiveSession): void {
         return;
       }
       if (autoRestarts >= 3) {
-        log('error', '编码器多次异常退出，已停止自动重启（检查显卡驱动或是否有其他远控软件占用桌面复制）');
+        log('error', '编码器多次异常退出，暂停快速重启（看门狗将每 5 秒重试；或检查显卡驱动/是否有其他远控软件占用桌面复制）');
         return;
       }
       autoRestarts++;
@@ -1175,6 +1214,7 @@ function endSession(reason: string): void {
   foregroundMonitor?.stop();
   foregroundMonitor = null;
   stopDisplayWatcher();
+  stopEncoderWatchdog();
   if (probeTimer) {
     clearTimeout(probeTimer);
     probeTimer = null;
@@ -1699,6 +1739,7 @@ async function startSession(
     startDesktopMonitor();
     startForegroundMonitor();
     startDisplayWatcher();
+    startEncoderWatchdog();
   }
 
   // The controller's quality choice drives the host's encoder; without
