@@ -307,6 +307,10 @@ export class Session {
 
   private probeHoldBps: number | null = null;
 
+  /** Per-packet transit accumulation for the next receiver report. */
+  private transitAccumUs = 0;
+  private transitSamples = 0;
+
   /**
    * Pin the pacer at a fixed rate for a link probe (null releases).
    * The encoder going flat-out is only half a measurement: the pacer
@@ -529,6 +533,20 @@ export class Session {
     const sendAbs = unwrapTs32(header.sendTsUs, receiveUs);
     this.gradient.add(receiveUs, sendAbs);
     this.jitter.add(receiveUs, sendAbs);
+    if (header.channel === Channel.Video) {
+      // Per-packet transit for the receiver report's one-way figure.
+      // The send timestamp is stamped when the pacer releases the
+      // packet, so this measures the network only — unlike a
+      // capture-timestamp basis, which also charges us for our own
+      // pacer queue and used to make every keyframe burst look like
+      // path congestion. The constant clock-epoch offset between the
+      // two processes is absorbed by the controller's floor tracking.
+      const transitUs = receiveUs - sendAbs;
+      if (transitUs > -60_000_000 && transitUs < 60_000_000) {
+        this.transitAccumUs += transitUs;
+        this.transitSamples++;
+      }
+    }
 
     switch (header.channel) {
       case Channel.Control:
@@ -699,20 +717,12 @@ export class Session {
     }
   }
 
-  /** One-way delay accumulation for the next receiver report. */
-  private oneWayAccumUs = 0;
-  private oneWaySamples = 0;
-
   private emitFrame(frame: IncomingFrame): void {
     this.framesReceived++;
     this.intervalFrames++;
     if (this.clock.synced) {
       const captureLocal = this.clock.toLocal(Number(frame.captureTsUs));
       if (captureLocal > 0) frame.oneWayUs = Math.max(0, frame.rxUs - captureLocal);
-    }
-    if (frame.oneWayUs > 0) {
-      this.oneWayAccumUs += frame.oneWayUs;
-      this.oneWaySamples++;
     }
     this.opts.onFrame?.(frame);
   }
@@ -793,10 +803,10 @@ export class Session {
       delayGradientUs: Math.round(this.gradient.take()),
       jitterUs: Math.round(this.jitter.valueUs),
       nowUs: this.nowUs(),
-      oneWayUs: this.oneWaySamples > 0 ? Math.round(this.oneWayAccumUs / this.oneWaySamples) : 0,
+      oneWayUs: this.transitSamples > 0 ? Math.round(this.transitAccumUs / this.transitSamples) : 0,
     };
-    this.oneWayAccumUs = 0;
-    this.oneWaySamples = 0;
+    this.transitAccumUs = 0;
+    this.transitSamples = 0;
     this.sendControl({ t: 'report', report });
   }
 

@@ -358,6 +358,18 @@ function probing(): boolean {
   return Date.now() < probeUntil;
 }
 let lastBitrateAdaptAt = 0;
+/**
+ * Last time a congestion verdict restarted the encoder. Verdicts may
+ * re-aim the (recorded) target every 8 s, but the encoder itself
+ * restarts at most every 20 s: in the 2026-11-25 evening session the
+ * verdict restarted it 70 times in 360 s, and every restart's
+ * keyframe burst manufactured the congestion evidence (frame drops,
+ * transit spikes) that justified the next verdict. The pacer follows
+ * the congestion target continuously and protects the link in the
+ * meantime; the encoder only re-baselines when the verdict proves
+ * persistent.
+ */
+let lastVerdictRestartAt = 0;
 /** Since when the congestion verdict has continuously justified a recovery. */
 let pendingRecoverAt = 0;
 /** Last congestion verdict seen (bps), re-run by the stats heartbeat. */
@@ -1555,6 +1567,7 @@ async function startSession(
   lastEncoderGeom = null;
   lastGeomChangeAt = 0;
   lastBitrateAdaptAt = 0;
+  lastVerdictRestartAt = 0;
   pendingRecoverAt = 0;
   lastVerdictBps = 0;
   inputReceived = 0;
@@ -1635,7 +1648,8 @@ async function startSession(
       verdictEmaKbps === 0 ? emaTargetKbps : Math.round(verdictEmaKbps + (emaTargetKbps - verdictEmaKbps) * 0.3);
     verdictApplied = true;
     log('info', `按网络状况调整编码码率至 ${adaptedBitrateKbps > 0 ? adaptedBitrateKbps : capKbps} kbps`);
-    if (active.encoder) {
+    if (active.encoder && now - lastVerdictRestartAt >= 20_000) {
+      lastVerdictRestartAt = now;
       active.encoder.stop();
       startEncoder(active);
     }

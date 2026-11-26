@@ -42,6 +42,8 @@ export class CongestionController {
   private consecutiveClean = 0;
   private overuseStreak = 0;
   private growStreak = 0;
+  /** True while a loss episode that already bought its decrease is ongoing. */
+  private lossEpisodeOpen = false;
 
   /** Smoothed RTT in µs. */
   srttUs = 0;
@@ -88,9 +90,9 @@ export class CongestionController {
     }
     this.hasReport = true;
 
-    // Track the forward path's one-way delay floor (from the receiver's
-    // per-frame measurements). It creeps up slowly (25 µs/sample) so a
-    // genuine route change re-baselines within seconds, while a
+    // Track the forward path's transit floor (from the receiver's
+    // per-packet measurements). It creeps up slowly (25 µs/sample) so
+    // a genuine route change re-baselines within seconds, while a
     // constant path pins it at the floor.
     const oneWay = s.oneWayUs ?? 0;
     if (oneWay > 0) {
@@ -127,15 +129,30 @@ export class CongestionController {
     const lossy = this.lossRate > 0.05;
     const mildlyLossy = this.lossRate > 0.02;
 
+    // One loss EPISODE, one decrease. The EWMA keeps a single 20 ms
+    // burst (a keyframe draining after an encoder restart can read
+    // 30-85% interval loss on Wi-Fi) above the 5% line for ~100 ms,
+    // and the old code re-charged it every 200 ms — 0.75^4 ≈ 0.32×
+    // for one burst, which is exactly the sawtooth the 2026-11-25
+    // evening session showed with a flat 35 ms one-way delay. The
+    // episode re-arms only once loss falls back under the mild line;
+    // genuinely sustained loss keeps the episode open but still gets
+    // its one decisive cut immediately, and the gradient path below
+    // remains available for queue-driven trouble throughout.
+    if (this.lossRate <= 0.02) this.lossEpisodeOpen = false;
     if (overusing || lossy) {
       this.overuseStreak = overusing ? this.overuseStreak + 1 : 0;
-      const sustained = lossy || this.overuseStreak >= 3;
+      const sustained =
+        (lossy && !this.lossEpisodeOpen) ||
+        (lossy && now - this.lastDecreaseMs > 2_000) ||
+        this.overuseStreak >= 3;
       if (sustained && now - this.lastDecreaseMs > 200) {
         const factor = lossy ? 0.75 : 0.9;
         this.target = Math.max(this.minBps, this.target * factor);
         this.lastDecreaseMs = now;
         this.consecutiveClean = 0;
         this.state = 'decrease';
+        if (lossy) this.lossEpisodeOpen = true;
       }
       return;
     }

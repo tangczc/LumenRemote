@@ -131,6 +131,54 @@ describe('estimators', () => {
     assert.ok(cc.targetBps >= start, `expected no decrease, got ${cc.targetBps} vs ${start}`);
   });
 
+  test('a single loss burst buys exactly one decrease, not a cascade', () => {
+    // Field regression (2026-11-25 evening): one-way delay flat at
+    // ~35 ms all session, yet verdicts sawtoothed 3.8M↔30M. One
+    // keyframe-drain burst reads as a huge interval loss; the EWMA
+    // then holds it over the lossy line for ~100 ms, and charging
+    // 0.75× every 200 ms turned one burst into 0.75^4 ≈ 0.32×.
+    let now = 0;
+    const cc = new CongestionController({ initialBps: 30_000_000, minBps: 400_000, maxBps: 37_500_000, nowMs: () => now });
+    for (let i = 0; i < 5; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+    }
+    const start = cc.targetBps;
+    now += 50;
+    cc.onSample({ lossRate: 0.85, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+    for (let i = 0; i < 40; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+    }
+    assert.ok(
+      cc.targetBps >= start * 0.7,
+      `one burst must not cascade: got ${cc.targetBps} vs start ${start}`,
+    );
+    // And it must climb back afterwards, not sit at the cut rate.
+    let recovered = cc.targetBps;
+    for (let i = 0; i < 40; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+      recovered = Math.max(recovered, cc.targetBps);
+    }
+    assert.ok(recovered > start * 0.75, `expected recovery after the burst, peaked ${recovered}`);
+  });
+
+  test('sustained loss keeps decreasing, slowly', () => {
+    let now = 0;
+    const cc = new CongestionController({ initialBps: 30_000_000, minBps: 400_000, maxBps: 37_500_000, nowMs: () => now });
+    for (let i = 0; i < 5; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+    }
+    const start = cc.targetBps;
+    for (let i = 0; i < 120; i++) {
+      now += 50;
+      cc.onSample({ lossRate: 0.3, delayGradientUs: 0, rttUs: 71_000, oneWayUs: 35_800 });
+    }
+    assert.ok(cc.targetBps < start * 0.5, `sustained loss must shed rate, got ${cc.targetBps} vs ${start}`);
+  });
+
   test('jitter tracks arrival variance', () => {
     const j = new JitterEstimator();
     for (let i = 0; i < 20; i++) j.add(i * 10_000 + (i % 2) * 5_000, i * 10_000);
